@@ -7,9 +7,11 @@
 #ifndef CARTA_SRC_UTIL_IMAGE_H_
 #define CARTA_SRC_UTIL_IMAGE_H_
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <carta-protobuf/defs.pb.h>
 #include <carta-protobuf/enums.pb.h>
@@ -232,13 +234,14 @@ struct PointXy {
  * spectral representation, and stokes parameters.
  */
 struct AxesInfo {
-    int x;         ///< Index of the X-axis for rendering.
-    int y;         ///< Index of the Y-axis for rendering.
-    int spatial_x; ///< Index of the spatial X-axis.
-    int spatial_y; ///< Index of the spatial Y-axis.
-    int spectral;  ///< Index of the spectral axis (if applicable).
-    int z;         ///< Index of the Z-axis (if applicable).
-    int stokes;    ///< Index of the stokes axis (if applicable).
+    int x;                  ///< Index of the X-axis for rendering.
+    int y;                  ///< Index of the Y-axis for rendering.
+    int spatial_x;          ///< Index of the spatial X-axis.
+    int spatial_y;          ///< Index of the spatial Y-axis.
+    int spectral;           ///< Index of the spectral axis (if applicable).
+    int z;                  ///< Index of the Z-axis (if applicable).
+    int stokes;             ///< Index of the stokes axis (if applicable).
+    std::vector<int> extra; ///< Indices of any further axes (not rendered, animated or Stokes); each is pinned at a current index.
 
     /**
      * @brief Default constructor initialising all axes to -1 (undefined).
@@ -278,6 +281,20 @@ struct AxesInfo {
      */
     std::vector<int> Spatial() {
         return {spatial_x, spatial_y};
+    }
+
+    /**
+     * @brief Number of extra (pinned) axes beyond x, y, z and Stokes.
+     */
+    size_t NumExtra() const {
+        return extra.size();
+    }
+
+    /**
+     * @brief Whether the given axis index is an extra (pinned) axis.
+     */
+    bool IsExtra(int axis) const {
+        return std::find(extra.begin(), extra.end(), axis) != extra.end();
     }
 };
 

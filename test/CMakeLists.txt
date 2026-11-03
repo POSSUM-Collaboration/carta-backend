@@ -50,6 +50,7 @@ set(TEST_SOURCES
         TestImageFitting.cc
         TestMain.cc
         TestMoment.cc
+        TestNdAxes.cc
         TestNormalizedUnits.cc
         TestProgramSettings.cc
         TestPvGenerator.cc

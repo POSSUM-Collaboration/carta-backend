@@ -8,6 +8,9 @@
 
 #include "CartaFitsImage.h"
 
+#include <algorithm>
+#include <vector>
+
 #include <casacore/casa/BasicSL/Constants.h>
 #include <casacore/casa/OS/File.h>
 #include <casacore/casa/Quanta/UnitMap.h>
@@ -372,11 +375,13 @@ void CartaFitsImage::GetFitsHeaderString(int& nheaders, std::string& hdrstr) {
         }
     }
 
-    // Get image parameters: BITPIX, NAXIS, NAXISn
-    int maxdim(4), bitpix(0), naxis(0);
-    long naxes[maxdim];
+    // Get image parameters: BITPIX, NAXIS, NAXISn (any number of axes)
+    int bitpix(0), naxis(0);
     status = 0;
-    fits_get_img_param(fptr, maxdim, &bitpix, &naxis, naxes, &status);
+    fits_get_img_dim(fptr, &naxis, &status);
+    CloseFileIfError(status, "Error getting image dimensions.");
+    std::vector<long> naxes(std::max(naxis, 1), 0);
+    fits_get_img_param(fptr, naxes.size(), &bitpix, &naxis, naxes.data(), &status);
     CloseFileIfError(status, "Error getting image parameters.");
 
     if (naxis < 2) {

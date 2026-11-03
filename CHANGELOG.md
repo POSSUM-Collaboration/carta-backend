@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+* Added support for images with any number of axes and any axis types: the first two non-Stokes axes are rendered, the next is the depth (channel) axis, Stokes is used only when the image has a polarization coordinate, and every further axis is pinned at a current index (`Frame::SetExtraAxisIndices`). Removes the 2D/3D/4D limit; the shape-based Stokes guess for 4D images now applies only to axes with no coordinate type at all.
+
 ### Fixed
 * Fixed incorrect scientic notation parsing ([#1632](https://github.com/CARTAvis/carta-backend/issues/1632)). 
 * Fixed error importing incorrect region name from a CRTF region file ([#1626](https://github.com/CARTAvis/carta-backend/issues/1626)). 

@@ -73,6 +73,7 @@ Frame::Frame(uint32_t session_id, std::shared_ptr<FileLoader> loader, const std:
     _image_shape = _loader->GetShape();
     _axes = _loader->GetAxes();
     _dims = _loader->GetDims();
+    _extra_indices.assign(_axes.NumExtra(), 0);
 
     _all_x = AxisRange(0, _dims.width - 1);
     _all_y = AxisRange(0, _dims.height - 1);
@@ -302,9 +303,26 @@ StokesSlicer Frame::GetImageSlicer(const AxisRange& x_range, const AxisRange& y_
         }
     }
 
+    // Pin extra axes at their current index (computed stokes images keep the full extra axes, so the index applies there too)
+    for (size_t i = 0; i < _axes.extra.size(); ++i) {
+        int axis = _axes.extra[i];
+        int index = i < _extra_indices.size() ? _extra_indices[i] : 0;
+        start(axis) = index;
+        end(axis) = index;
+    }
+
     // slicer for image data
     casacore::Slicer section(start, end, casacore::Slicer::endIsLast);
     return StokesSlicer(stokes_source, section);
+}
+
+std::vector<int> Frame::ExtraAxisIndices() {
+    return _extra_indices;
+}
+
+bool Frame::SetExtraAxisIndices(const std::vector<int>& indices, std::string& message) {
+    // Set the current index of each extra axis; returns whether anything changed (image cache is reloaded)
+    return SetImageChannels(_z_index, _stokes_index, indices, message);
 }
 
 bool Frame::CheckZ(int z) {
@@ -333,37 +351,58 @@ bool Frame::IsConnected() {
 // Image parameters: view, z/stokes, slicers for data cache
 
 bool Frame::SetImageChannels(int new_z, int new_stokes, std::string& message) {
+    return SetImageChannels(new_z, new_stokes, _extra_indices, message);
+}
+
+bool Frame::SetImageChannels(int new_z, int new_stokes, const std::vector<int>& new_extra_indices, std::string& message) {
+    // Set the current z, stokes and extra-axis indices together, reloading the image cache once if anything changed
     bool updated(false);
 
     if (!_valid) {
         message = "No file loaded";
-    } else {
-        if ((new_z != _z_index) || (new_stokes != _stokes_index)) {
-            bool z_ok(CheckZ(new_z));
-            bool stokes_ok(CheckStokes(new_stokes));
-            if (z_ok && stokes_ok) {
-                // invalidate the image cache
-                InvalidateImageCache();
+        return updated;
+    }
 
-                _z_index = new_z;
-                _stokes_index = new_stokes;
+    if (new_extra_indices.size() != _axes.extra.size()) {
+        message = fmt::format("Expected {} extra axis indices, received {}", _axes.extra.size(), new_extra_indices.size());
+        return updated;
+    }
+    for (size_t i = 0; i < new_extra_indices.size(); ++i) {
+        if ((new_extra_indices[i] < 0) || (new_extra_indices[i] >= _image_shape(_axes.extra[i]))) {
+            message = fmt::format("Index {} is invalid for axis {}", new_extra_indices[i], _axes.extra[i] + 1);
+            return updated;
+        }
+    }
 
-                if (!(_use_tile_cache && _loader->HasMip(2)) || Stokes::IsComputed(_stokes_index)) {
-                    // Reload the full channel cache for loaders which use it
-                    FillImageCache();
-                } else {
-                    // Don't reload the full channel cache here because we may not need it
+    bool z_stokes_changed = (new_z != _z_index) || (new_stokes != _stokes_index);
+    bool extra_changed = (new_extra_indices != _extra_indices);
 
-                    if (_use_tile_cache) {
-                        // invalidate / clear the full resolution tile cache
-                        _tile_cache.Reset(_z_index, _stokes_index);
-                    }
-                }
+    if (z_stokes_changed || extra_changed) {
+        bool z_ok(CheckZ(new_z));
+        bool stokes_ok(CheckStokes(new_stokes));
+        if (z_ok && stokes_ok) {
+            // invalidate the image cache
+            InvalidateImageCache();
 
-                updated = true;
+            _z_index = new_z;
+            _stokes_index = new_stokes;
+            _extra_indices = new_extra_indices;
+
+            if (!(_use_tile_cache && _loader->HasMip(2)) || Stokes::IsComputed(_stokes_index)) {
+                // Reload the full channel cache for loaders which use it
+                FillImageCache();
             } else {
-                message = fmt::format("Channel {} or Stokes {} is invalid in image", new_z, new_stokes);
+                // Don't reload the full channel cache here because we may not need it
+
+                if (_use_tile_cache) {
+                    // invalidate / clear the full resolution tile cache
+                    _tile_cache.Reset(_z_index, _stokes_index);
+                }
             }
+
+            updated = true;
+        } else {
+            message = fmt::format("Channel {} or Stokes {} is invalid in image", new_z, new_stokes);
         }
     }
     return updated;
@@ -1729,6 +1768,12 @@ bool Frame::GetSlicerData(const StokesSlicer& stokes_slicer, float* data) {
             slicer_start(_axes.stokes) = 0;
             slicer_end(_axes.stokes) = 0;
         }
+        for (auto axis : _axes.extra) {
+            // the cache holds the plane at the current extra indices
+            cache_shape(axis) = 1;
+            slicer_start(axis) = 0;
+            slicer_end(axis) = 0;
+        }
         casacore::Slicer cache_slicer(slicer_start, slicer_end, casacore::Slicer::endIsLast);
 
         queuing_rw_mutex_scoped cache_lock(&_cache_mutex, false); // read lock
@@ -2017,7 +2062,7 @@ void Frame::SaveFile(const std::string& root_folder, const CARTA::SaveFile& save
             image = sub_image.cloneII();
             _loader->CloseImageIfUpdated();
         }
-    } else if (image_shape.size() > 2 && image_shape.size() < 5) {
+    } else if (image_shape.size() > 2) {
         try {
             if (region) {
                 auto latt_region_holder = LattRegionHolder(image_region->cloneRegion());
@@ -2223,44 +2268,26 @@ void Frame::ValidateChannelStokes(std::vector<int>& channels, std::vector<int>& 
 // Input image_shape as casacore::IPosition of source image
 // Return casacore::Slicer(start, end, stride) for apply subImage()
 casacore::Slicer Frame::GetExportImageSlicer(const CARTA::SaveFile& save_file_msg, casacore::IPosition image_shape) {
+    // Slicer for the whole render plane, the requested channel/stokes ranges, and all of every extra axis
     auto channels = std::vector<int>();
     auto stokes = std::vector<int>();
     ValidateChannelStokes(channels, stokes, save_file_msg);
 
-    casacore::IPosition start;
-    casacore::IPosition end;
-    casacore::IPosition stride;
-    switch (image_shape.size()) {
-        // 3 dimensional cube image
-        case 3:
-            if (_axes.z == 2) {
-                // Channels present
-                start = casacore::IPosition(3, 0, 0, channels[0]);
-                end = casacore::IPosition(3, image_shape[0] - 1, image_shape[1] - 1, channels[1]);
-                stride = casacore::IPosition(3, 1, 1, channels[2]);
-            } else {
-                // Stokes present
-                start = casacore::IPosition(3, 0, 0, stokes[0]);
-                end = casacore::IPosition(3, image_shape[0] - 1, image_shape[1] - 1, stokes[1]);
-                stride = casacore::IPosition(3, 1, 1, stokes[2]);
-            }
-            break;
-        // 4 dimensional cube image
-        case 4:
-            if (_axes.z == 2) {
-                // Channels present before stokes
-                start = casacore::IPosition(4, 0, 0, channels[0], stokes[0]);
-                end = casacore::IPosition(4, image_shape[0] - 1, image_shape[1] - 1, channels[1], stokes[1]);
-                stride = casacore::IPosition(4, 1, 1, channels[2], stokes[2]);
-            } else {
-                // Channels present after stokes
-                start = casacore::IPosition(4, 0, 0, stokes[0], channels[0]);
-                end = casacore::IPosition(4, image_shape[0] - 1, image_shape[1] - 1, stokes[1], channels[1]);
-                stride = casacore::IPosition(4, 1, 1, stokes[2], channels[2]);
-            }
-            break;
-        default:
-            break;
+    casacore::IPosition start(image_shape.size(), 0);
+    casacore::IPosition end(image_shape - 1);
+    casacore::IPosition stride(image_shape.size(), 1);
+
+    if (image_shape.size() > 2) {
+        if (_axes.z >= 0) {
+            start(_axes.z) = channels[0];
+            end(_axes.z) = channels[1];
+            stride(_axes.z) = channels[2];
+        }
+        if (_axes.stokes >= 0) {
+            start(_axes.stokes) = stokes[0];
+            end(_axes.stokes) = stokes[1];
+            stride(_axes.stokes) = stokes[2];
+        }
     }
     return casacore::Slicer(start, end, stride, casacore::Slicer::endIsLast);
 }
@@ -2279,65 +2306,41 @@ casacore::Slicer Frame::GetExportRegionSlicer(const CARTA::SaveFile& save_file_m
     auto stokes = std::vector<int>();
     ValidateChannelStokes(channels, stokes, save_file_msg);
 
-    casacore::IPosition start;
-    casacore::IPosition end;
-    casacore::IPosition stride;
+    // Region covers the render plane; other axes as for the whole image
+    casacore::IPosition start(image_shape.size(), 0);
+    casacore::IPosition end(image_shape - 1);
+    casacore::IPosition stride(image_shape.size(), 1);
+    end(_axes.x) = region_shape[0] - 1;
+    end(_axes.y) = region_shape[1] - 1;
 
-    switch (image_shape.size()) {
-        // 3 dimensional cube image
-        case 3:
-            if (_axes.z == 2) {
-                // Channels present
-                start = casacore::IPosition(3, 0, 0, channels[0]);
-                end = casacore::IPosition(3, region_shape[0] - 1, region_shape[1] - 1, channels[1]);
-                stride = casacore::IPosition(3, 1, 1, channels[2]);
-                if (region_shape.size() < image_shape.size()) {
-                    auto region_ext = casacore::LCExtension(*latt_region_holder.asLCRegionPtr(), casacore::IPosition(1, 2),
-                        casacore::LCBox(
-                            casacore::IPosition(1, 0), casacore::IPosition(1, image_shape[2]), casacore::IPosition(1, image_shape[2])));
-                    latt_region_holder = LattRegionHolder(region_ext);
-                }
-            } else {
-                // Stokes present
-                start = casacore::IPosition(3, 0, 0, stokes[0]);
-                end = casacore::IPosition(3, region_shape[0] - 1, region_shape[1] - 1, stokes[1]);
-                stride = casacore::IPosition(3, 1, 1, stokes[2]);
-                if (region_shape.size() < image_shape.size()) {
-                    auto region_ext = casacore::LCExtension(*latt_region_holder.asLCRegionPtr(), casacore::IPosition(1, 2),
-                        casacore::LCBox(
-                            casacore::IPosition(1, 0), casacore::IPosition(1, image_shape[3]), casacore::IPosition(1, image_shape[3])));
-                    latt_region_holder = LattRegionHolder(region_ext);
+    if (image_shape.size() > 2) {
+        if (_axes.z >= 0) {
+            start(_axes.z) = channels[0];
+            end(_axes.z) = channels[1];
+            stride(_axes.z) = channels[2];
+        }
+        if (_axes.stokes >= 0) {
+            start(_axes.stokes) = stokes[0];
+            end(_axes.stokes) = stokes[1];
+            stride(_axes.stokes) = stokes[2];
+        }
+
+        if (region_shape.size() < image_shape.size()) {
+            // Extend the 2D region over every non-render axis
+            std::vector<int> extend_axes;
+            for (size_t axis = 0; axis < image_shape.size(); ++axis) {
+                if ((axis != _axes.x) && (axis != _axes.y)) {
+                    extend_axes.push_back(axis);
                 }
             }
-            break;
-        // 4 dimensional cube image
-        case 4:
-            if (_axes.z == 2) {
-                // Channels present before stokes
-                start = casacore::IPosition(4, 0, 0, channels[0], stokes[0]);
-                end = casacore::IPosition(4, region_shape[0] - 1, region_shape[1] - 1, channels[1], stokes[1]);
-                stride = casacore::IPosition(4, 1, 1, channels[2], stokes[2]);
-                if (region_shape.size() < image_shape.size()) {
-                    auto region_ext = casacore::LCExtension(*latt_region_holder.asLCRegionPtr(), casacore::IPosition(2, 2, 3),
-                        casacore::LCBox(casacore::IPosition(2, 0, 0), casacore::IPosition(2, image_shape[2], image_shape[3]),
-                            casacore::IPosition(2, image_shape[2], image_shape[3])));
-                    latt_region_holder = LattRegionHolder(region_ext);
-                }
-            } else {
-                // Channels present after stokes
-                start = casacore::IPosition(4, 0, 0, stokes[0], channels[0]);
-                end = casacore::IPosition(4, region_shape[0] - 1, region_shape[1] - 1, stokes[1], channels[1]);
-                stride = casacore::IPosition(4, 1, 1, stokes[2], channels[2]);
-                if (region_shape.size() < image_shape.size()) {
-                    auto region_ext = casacore::LCExtension(*latt_region_holder.asLCRegionPtr(), casacore::IPosition(2, 2, 3),
-                        casacore::LCBox(casacore::IPosition(2, 0, 0), casacore::IPosition(2, image_shape[3], image_shape[2]),
-                            casacore::IPosition(2, image_shape[3], image_shape[2])));
-                    latt_region_holder = LattRegionHolder(region_ext);
-                }
+            casacore::IPosition extend(extend_axes.size()), blc(extend_axes.size(), 0), trc(extend_axes.size());
+            for (size_t i = 0; i < extend_axes.size(); ++i) {
+                extend(i) = extend_axes[i];
+                trc(i) = image_shape[extend_axes[i]];
             }
-            break;
-        default:
-            break;
+            auto region_ext = casacore::LCExtension(*latt_region_holder.asLCRegionPtr(), extend, casacore::LCBox(blc, trc, trc));
+            latt_region_holder = LattRegionHolder(region_ext);
+        }
     }
     return casacore::Slicer(start, end, stride, casacore::Slicer::endIsLast);
 }

@@ -202,7 +202,10 @@ std::shared_ptr<casacore::CoordinateSystem> FileLoader::GetCoordinateSystem(cons
 }
 
 bool FileLoader::FindCoordinateAxes(std::string& message) {
-    // Set image shape, axes and dimensions. Spectral axis may or may not be z axis.
+    // Set image shape, axes and dimensions for an image with any number of axes (>= 2).
+    // Render axes are the first two non-Stokes axes, z is the first remaining axis (spectral or not),
+    // Stokes is the polarization axis if casacore found one, and every other axis is "extra":
+    // it is not rendered or animated but pinned at a current index.
 
     if (!HasData(FileInfo::Data::Image)) {
         message = "Image has no data.";
@@ -210,8 +213,8 @@ bool FileLoader::FindCoordinateAxes(std::string& message) {
     }
 
     // Dimension check
-    if (_num_dims < 2 || _num_dims > 4) {
-        message = "Image must be 2D, 3D, or 4D.";
+    if (_num_dims < 2) {
+        message = "Image must have at least two axes.";
         return false;
     }
 
@@ -221,7 +224,7 @@ bool FileLoader::FindCoordinateAxes(std::string& message) {
     }
 
     int z_axis(-1), spectral_axis(-1), stokes_axis(-1);
-    std::vector<int> render_axes, spatial_axes{-1, -1};
+    std::vector<int> render_axes, spatial_axes{-1, -1}, extra_axes;
 
     // Get spectral and stokes axis
     spectral_axis = _coord_sys->spectralAxisNumber();
@@ -260,29 +263,32 @@ bool FileLoader::FindCoordinateAxes(std::string& message) {
         return true;
     }
 
-    // Cope with incomplete/invalid headers for 3D, 4D images
-    bool no_spectral(spectral_axis < 0), no_stokes(stokes_axis < 0);
-    if ((no_spectral && no_stokes) && (_num_dims == 3)) {
-        // assume third is spectral with no stokes
-        spectral_axis = 2;
-    }
-
-    if ((no_spectral || no_stokes) && (_num_dims == 4)) {
-        if (no_spectral && !no_stokes) { // stokes is known
+    // Cope with headers that do not describe their axes at all: for a 4D image whose third and/or fourth axis
+    // has no coordinate type, fall back to the traditional [spectral, stokes] guess by shape (at most 4 stokes).
+    // An axis that does have a type (TIME, FDEP, ...) is never guessed to be Stokes.
+    if (_num_dims == 4) {
+        auto axis_names = _coord_sys->worldAxisNames();
+        auto is_unnamed = [&](int axis) {
+            if ((axis < 0) || (axis >= axis_names.size())) {
+                return false;
+            }
+            casacore::String name(axis_names(axis));
+            name.trim();
+            return name.empty();
+        };
+        bool no_spectral(spectral_axis < 0), no_stokes(stokes_axis < 0);
+        if (no_spectral && !no_stokes && is_unnamed(stokes_axis == 3 ? 2 : 3)) {
             spectral_axis = (stokes_axis == 3 ? 2 : 3);
-        } else if (!no_spectral && no_stokes) { // spectral is known
+        } else if (!no_spectral && no_stokes && is_unnamed(spectral_axis == 3 ? 2 : 3)) {
             stokes_axis = (spectral_axis == 3 ? 2 : 3);
-        } else { // neither is known
-            // guess by shape (max 4 stokes)
+        } else if (no_spectral && no_stokes && is_unnamed(2) && is_unnamed(3)) {
             if (_image_shape(2) > 4) {
                 spectral_axis = 2;
                 stokes_axis = 3;
             } else if (_image_shape(3) > 4) {
                 spectral_axis = 3;
                 stokes_axis = 2;
-            }
-
-            if ((spectral_axis < 0) && (stokes_axis < 0)) {
+            } else {
                 // could not guess, assume [spectral, stokes]
                 spectral_axis = 2;
                 stokes_axis = 3;
@@ -290,12 +296,22 @@ bool FileLoader::FindCoordinateAxes(std::string& message) {
         }
     }
 
-    // Z axis is non-render axis that is not stokes (if any)
+    // Z axis is the first non-render axis that is not stokes (if any); remaining axes are extra
     for (size_t i = 0; i < _num_dims; ++i) {
         if ((i != render_axes[0]) && (i != render_axes[1]) && (i != stokes_axis)) {
-            z_axis = i;
-            break;
+            if (z_axis < 0) {
+                z_axis = i;
+            } else {
+                extra_axes.push_back(i);
+            }
         }
+    }
+
+    // Cope with an incomplete header: if the image has no spectral coordinate, treat the z axis as the
+    // spectral (channel) axis, as before. Other axes are taken as described by their coordinates;
+    // nothing is guessed to be Stokes any more.
+    if ((spectral_axis < 0) && (z_axis >= 0)) {
+        spectral_axis = z_axis;
     }
 
     size_t num_stokes = DimsInfo::FromAxis(stokes_axis, _image_shape);
@@ -314,6 +330,7 @@ bool FileLoader::FindCoordinateAxes(std::string& message) {
     }
 
     _axes = AxesInfo(render_axes, spatial_axes, spectral_axis, z_axis, stokes_axis);
+    _axes.extra = extra_axes;
     _dims = DimsInfo(_axes, _image_shape);
 
     return true;

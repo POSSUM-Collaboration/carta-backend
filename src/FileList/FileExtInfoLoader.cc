@@ -8,6 +8,7 @@
 
 #include "FileExtInfoLoader.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include <fitsio.h>
@@ -138,8 +139,8 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                 casacore::IPosition image_shape(image->shape());
                 unsigned int num_dim = image_shape.size();
 
-                if (num_dim < 2 || num_dim > 4) {
-                    message = "Image must be 2D, 3D or 4D.";
+                if (num_dim < 2) {
+                    message = "Image must have at least two axes.";
                     return info_ok;
                 }
 
@@ -586,7 +587,7 @@ void FileExtInfoLoader::AddInitialComputedEntries(const std::string& hdu, CARTA:
     int bitpix(0);
     double bscale(1.0), bzero(0.0);
     casacore::IPosition shape;
-    casacore::Vector<casacore::String> axes_names(4, "NA");
+    casacore::Vector<casacore::String> axes_names(4, "NA"); // resized once NAXIS is known
     std::vector<std::string> spectral_ctypes = {"FREQ", "WAV", "ENER", "VOPT", "ZOPT", "VELO", "VRAD", "BETA", "FELO"};
 
     for (int i = 0; i < extended_info.header_entries_size(); ++i) {
@@ -601,6 +602,12 @@ void FileExtInfoLoader::AddInitialComputedEntries(const std::string& hdu, CARTA:
 
             if (naxis_index == "S") { // just "NAXIS"
                 shape.resize(entry_num_value);
+                if (entry_num_value > axes_names.size()) {
+                    axes_names.resize(entry_num_value, true);
+                    for (size_t i = 4; i < axes_names.size(); ++i) {
+                        axes_names[i] = "NA";
+                    }
+                }
             } else { // NAXISn (1-based)
                 int n = stoi(naxis_index);
                 shape(n - 1) = entry_num_value;
@@ -633,16 +640,25 @@ void FileExtInfoLoader::AddInitialComputedEntries(const std::string& hdu, CARTA:
                 }
             }
 
-            // Depth axis is not the first two axes [0, 1], i.e., non-render axis that is not stokes (if any)
-            if (axis_num > 1 && axis_num != axes.stokes) {
-                axes.z = axis_num;
-            }
         } else if (entry_name.find("BITPIX") == 0) {
             bitpix = header_entry.numeric_value();
         } else if (entry_name.find("BSCALE") == 0) {
             bscale = header_entry.numeric_value();
         } else if (entry_name.find("BZERO") == 0) {
             bzero = header_entry.numeric_value();
+        }
+    }
+
+    // Depth axis is the first non-render axis that is not stokes (if any); any further axes are extra
+    axes.z = -1;
+    axes.extra.clear();
+    for (int axis_num = 2; axis_num < shape.size(); ++axis_num) {
+        if (axis_num != axes.stokes) {
+            if (axes.z < 0) {
+                axes.z = axis_num;
+            } else {
+                axes.extra.push_back(axis_num);
+            }
         }
     }
 
@@ -676,6 +692,79 @@ void FileExtInfoLoader::AddDataTypeEntry(
     Message::AddComputedEntry(extended_info, "Data type", ss.str());
 }
 
+void FileExtInfoLoader::AddAxisInfo(CARTA::FileInfoExtended& extended_info, const casacore::IPosition& shape, const AxesInfo& axes) {
+    // Fill FileInfoExtended.axes: type, unit, size, role and (for non-render axes) linear world values from the header
+    const int num_dims = shape.size();
+    const size_t max_world_values(10000);
+    std::vector<std::string> ctype(num_dims), cunit(num_dims);
+    std::vector<double> crval(num_dims, 0.0), cdelt(num_dims, 0.0), crpix(num_dims, 0.0);
+    std::vector<bool> has_crval(num_dims, false), has_cdelt(num_dims, false), has_crpix(num_dims, false);
+
+    for (int i = 0; i < extended_info.header_entries_size(); ++i) {
+        const auto& entry = extended_info.header_entries(i);
+        const auto& name = entry.name();
+        if (name.size() < 6) {
+            continue;
+        }
+        std::string prefix = name.substr(0, 5);
+        std::string suffix = name.substr(5);
+        if (suffix.empty() || !std::all_of(suffix.begin(), suffix.end(), ::isdigit)) {
+            continue; // not CxxxxN, or an alternate WCS (e.g. CRVAL1A)
+        }
+        int axis = std::stoi(suffix) - 1;
+        if (axis < 0 || axis >= num_dims) {
+            continue;
+        }
+
+        if (prefix == "CTYPE") {
+            ctype[axis] = entry.value();
+        } else if (prefix == "CUNIT") {
+            cunit[axis] = entry.value();
+        } else if (prefix == "CRVAL") {
+            crval[axis] = entry.numeric_value();
+            has_crval[axis] = true;
+        } else if (prefix == "CDELT") {
+            cdelt[axis] = entry.numeric_value();
+            has_cdelt[axis] = true;
+        } else if (prefix == "CRPIX") {
+            crpix[axis] = entry.numeric_value();
+            has_crpix[axis] = true;
+        }
+    }
+
+    extended_info.clear_axes();
+    for (int axis = 0; axis < num_dims; ++axis) {
+        auto* info = extended_info.add_axes();
+        info->set_number(axis + 1);
+        info->set_ctype(ctype[axis]);
+        info->set_cunit(cunit[axis]);
+        info->set_size(shape(axis));
+
+        CARTA::AxisRole role(CARTA::AxisRole::AxisExtra);
+        if (axis == axes.x) {
+            role = CARTA::AxisRole::AxisX;
+        } else if (axis == axes.y) {
+            role = CARTA::AxisRole::AxisY;
+        } else if (axis == axes.stokes) {
+            role = CARTA::AxisRole::AxisStokes;
+        } else if (axis == axes.z) {
+            role = CARTA::AxisRole::AxisZ;
+        }
+        info->set_role(role);
+
+        info->set_crval(crval[axis]);
+        info->set_cdelt(cdelt[axis]);
+        info->set_crpix(crpix[axis]);
+
+        bool render_axis = (role == CARTA::AxisRole::AxisX) || (role == CARTA::AxisRole::AxisY);
+        if (!render_axis && has_crval[axis] && has_cdelt[axis] && has_crpix[axis] && (shape(axis) <= max_world_values)) {
+            for (ssize_t k = 0; k < shape(axis); ++k) {
+                info->add_world_values(crval[axis] + (k + 1 - crpix[axis]) * cdelt[axis]);
+            }
+        }
+    }
+}
+
 void FileExtInfoLoader::AddShapeEntries(CARTA::FileInfoExtended& extended_info, const casacore::IPosition& shape, const AxesInfo& axes,
     casacore::Vector<casacore::String>& axes_names) {
     // Set fields/header entries for shape: dimensions, width, height, depth, stokes
@@ -687,8 +776,8 @@ void FileExtInfoLoader::AddShapeEntries(CARTA::FileInfoExtended& extended_info, 
     Message::AddAxesNumbers(extended_info, axes.spatial_x + 1, axes.spatial_y + 1, axes.spectral + 1, axes.stokes + 1, axes.z + 1);
 
     if (axes_names.empty()) {
-        // Set axis names with respect to axis numbers 1~4
-        axes_names.assign(casacore::Vector<casacore::String>(4, "NA"));
+        // Set axis names from CTYPEn header entries
+        axes_names.assign(casacore::Vector<casacore::String>(num_dims, "NA"));
         for (int i = 0; i < extended_info.header_entries_size(); ++i) {
             auto header_entry = extended_info.header_entries(i);
             auto entry_name = header_entry.name();
@@ -696,18 +785,23 @@ void FileExtInfoLoader::AddShapeEntries(CARTA::FileInfoExtended& extended_info, 
                 auto entry_value = header_entry.value();
                 if (!entry_value.empty()) {
                     entry_value = entry_value.substr(0, entry_value.find("-", 0));
-                    if (entry_name.back() == '1') {
-                        axes_names[0] = entry_value;
-                    } else if (entry_name.back() == '2') {
-                        axes_names[1] = entry_value;
-                    } else if (entry_name.back() == '3') {
-                        axes_names[2] = entry_value;
-                    } else if (entry_name.back() == '4') {
-                        axes_names[3] = entry_value;
+                    try {
+                        int axis_num = std::stoi(entry_name.substr(5));
+                        if (axis_num >= 1 && axis_num <= num_dims) {
+                            axes_names[axis_num - 1] = entry_value;
+                        }
+                    } catch (const std::exception&) {
+                        // not a CTYPEn keyword
                     }
                 }
             }
         }
+    } else if (axes_names.size() < num_dims) {
+        casacore::Vector<casacore::String> padded(num_dims, "NA");
+        for (size_t i = 0; i < axes_names.size(); ++i) {
+            padded[i] = axes_names[i];
+        }
+        axes_names.reference(padded);
     }
 
     // In case if the stokes axis name is not available from the header info
@@ -715,22 +809,26 @@ void FileExtInfoLoader::AddShapeEntries(CARTA::FileInfoExtended& extended_info, 
         axes_names[axes.stokes] = "STOKES";
     }
 
-    // shape computed_entry
-    std::string shape_string;
-    switch (num_dims) {
-        case 2:
-            shape_string = fmt::format("[{}, {}] ({}, {})", shape(0), shape(1), axes_names[0], axes_names[1]);
-            break;
-        case 3:
-            shape_string =
-                fmt::format("[{}, {}, {}] ({}, {}, {})", shape(0), shape(1), shape(2), axes_names[0], axes_names[1], axes_names[2]);
-            break;
-        case 4:
-            shape_string = fmt::format("[{}, {}, {}, {}] ({}, {}, {}, {})", shape(0), shape(1), shape(2), shape(3), axes_names[0],
-                axes_names[1], axes_names[2], axes_names[3]);
-            break;
+    // shape computed_entry, e.g. [100, 100, 20, 4] (RA, DEC, FREQ, STOKES)
+    std::string shape_values, shape_names;
+    for (int i = 0; i < num_dims; ++i) {
+        shape_values += (i ? ", " : "") + std::to_string(shape(i));
+        shape_names += (i ? ", " : "") + std::string(axes_names[i]);
     }
-    Message::AddComputedEntry(extended_info, "Shape", shape_string);
+    Message::AddComputedEntry(extended_info, "Shape", fmt::format("[{}] ({})", shape_values, shape_names));
+
+    // Describe every axis for the frontend
+    AddAxisInfo(extended_info, shape, axes);
+
+    if (!axes.extra.empty()) {
+        // Axes beyond x, y, z and Stokes, pinned at an index when rendered
+        std::string extra_axes;
+        for (size_t i = 0; i < axes.extra.size(); ++i) {
+            int axis = axes.extra[i];
+            extra_axes += fmt::format("{}{} [{}]", i ? ", " : "", std::string(axes_names[axis]), shape(axis));
+        }
+        Message::AddComputedEntry(extended_info, "Extra axes", extra_axes);
+    }
 
     if (axes.spectral >= 0) {
         // header entry for number of channels

@@ -122,6 +122,11 @@ public:
         return _required_animation_tiles;
     };
     bool SetImageChannels(int new_z, int new_stokes, std::string& message);
+    bool SetImageChannels(int new_z, int new_stokes, const std::vector<int>& new_extra_indices, std::string& message);
+
+    // Extra (pinned) axes beyond x, y, z and Stokes: current index per extra axis, in AxesInfo::extra order
+    std::vector<int> ExtraAxisIndices();
+    bool SetExtraAxisIndices(const std::vector<int>& indices, std::string& message);
 
     // Cursor
     bool SetCursor(float x, float y);
@@ -285,7 +290,8 @@ protected:
     casacore::IPosition _image_shape;
     AxesInfo _axes; // X and Y are render axes, Z is depth axis (non-render axis) that is not stokes (if any)
     DimsInfo _dims;
-    int _z_index, _stokes_index; // current index
+    int _z_index, _stokes_index;     // current index
+    std::vector<int> _extra_indices; // current index of each extra axis (AxesInfo::extra order), default 0
     AxisRange _all_x, _all_y, _all_z;
 
     // Image settings

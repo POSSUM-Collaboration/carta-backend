@@ -701,10 +701,12 @@ void Session::OnAddRequiredTiles(const CARTA::AddRequiredTiles& message, int z, 
         requested_z = _frames.at(file_id)->CurrentZ();
     }
     auto stokes = _frames.at(file_id)->CurrentStokes();
+    auto extra_indices = _frames.at(file_id)->ExtraAxisIndices();
     auto sync_id = ++_sync_id;
 
     int num_tiles = message.tiles_size();
     auto start_message = Message::RasterTileSync(file_id, requested_z, stokes, sync_id, animation_id, num_tiles, false);
+    *start_message.mutable_extra_axis_indices() = {extra_indices.begin(), extra_indices.end()};
     SendFileEvent(file_id, CARTA::EventType::RASTER_TILE_SYNC, 0, start_message);
 
     CARTA::CompressionType compression_type = message.compression_type();
@@ -722,6 +724,7 @@ void Session::OnAddRequiredTiles(const CARTA::AddRequiredTiles& message, int z, 
                 const auto& encoded_coordinate = message.tiles(i);
                 auto tile = Tile::Decode(encoded_coordinate);
                 auto raster_tile_data = Message::RasterTileData(file_id, sync_id, animation_id);
+                *raster_tile_data.mutable_extra_axis_indices() = {extra_indices.begin(), extra_indices.end()};
                 bool tile_error(false);
                 if (_frames.count(file_id) && _frames.at(file_id)->FillRasterTileData(raster_tile_data, tile, requested_z, stokes,
                                                   compression_type, compression_quality, is_current_z, tile_error)) {
@@ -747,6 +750,7 @@ void Session::OnAddRequiredTiles(const CARTA::AddRequiredTiles& message, int z, 
 
     // Send final message with no tiles to signify end of the tile stream, for synchronisation purposes
     auto final_message = Message::RasterTileSync(file_id, requested_z, stokes, sync_id, animation_id, num_tiles, true);
+    *final_message.mutable_extra_axis_indices() = {extra_indices.begin(), extra_indices.end()};
     SendFileEvent(file_id, CARTA::EventType::RASTER_TILE_SYNC, 0, final_message);
 }
 
@@ -828,13 +832,20 @@ void Session::OnSetImageChannels(const CARTA::SetImageChannels& message) {
                 }
             }
         } else {
-            // Set new channel and/or stokes
+            // Set new channel and/or stokes, and the index of any extra (pinned) axes
             auto z_target = message.channel();
             auto stokes_target = message.stokes();
             bool z_changed(z_target != frame->CurrentZ());
             bool stokes_changed(stokes_target != frame->CurrentStokes());
+            std::vector<int> extra_indices = frame->ExtraAxisIndices();
+            if (message.extra_axis_indices_size() > 0) {
+                extra_indices.assign(message.extra_axis_indices().begin(), message.extra_axis_indices().end());
+            }
+            bool extra_changed(extra_indices != frame->ExtraAxisIndices());
             std::string err_message;
-            if (frame->SetImageChannels(z_target, stokes_target, err_message)) {
+            if (frame->SetImageChannels(z_target, stokes_target, extra_indices, err_message)) {
+                // A change of extra axis index invalidates everything a channel change does
+                z_changed |= extra_changed;
                 // Send Contour data if required
                 SendContourData(file_id);
                 // Send vector field data if required
