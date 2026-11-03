@@ -145,8 +145,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Check out the protobuf submodule only (the test data submodule would fetch Git LFS objects)
-        run: git submodule update --init carta-protobuf
+      - name: Check out submodules (all but the test data, which would fetch Git LFS objects)
+        run: |
+          git config submodule.test/data.update none
+          git submodule update --init --recursive
 
       - name: Install build dependencies (as in Dockerfiles/Dockerfile-ubuntu-24.04)
         run: |
