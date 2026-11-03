@@ -25,6 +25,7 @@
 
 #include "../ImageData/CartaFitsImage.h"
 #include "../ImageData/CartaHdf5Image.h"
+#include "../ImageData/TransposedImage.h"
 #include "FileList/FitsHduList.h"
 #include "Logger/Logger.h"
 #include "Util/Casacore.h"
@@ -50,6 +51,26 @@ bool FileExtInfoLoader::FillFitsFileInfoMap(
         }
 
         for (auto& hdu_info : hdu_info_map) {
+            // Header-only path: renumber axis keywords if the loader will present the image with permuted axes
+            const auto& axis_order = _loader->GetAxisOrder();
+            if (_loader->IsTransposed()) {
+                std::vector<int> inverse(axis_order.size());
+                bool valid(true);
+                for (size_t i = 0; i < axis_order.size(); ++i) {
+                    if (axis_order[i] < 0 || axis_order[i] >= static_cast<int>(axis_order.size())) {
+                        valid = false;
+                        break;
+                    }
+                    inverse[axis_order[i]] = i;
+                }
+                if (valid) {
+                    for (int i = 0; i < hdu_info.second.header_entries_size(); ++i) {
+                        auto* entry = hdu_info.second.mutable_header_entries(i);
+                        entry->set_name(TransposedImage::RenumberAxisKeyword(entry->name(), inverse));
+                    }
+                }
+            }
+
             AxesInfo axes;
             axes.x = 0; // default
             axes.y = 1; // default
@@ -82,7 +103,7 @@ bool FileExtInfoLoader::FillFitsFileInfoMap(
     }
 
     map_ok = !hdu_info_map.empty();
-    if (!map_ok) {
+    if (!map_ok && message.empty()) {
         message = "Error loading headers or image.";
     }
 
@@ -147,14 +168,29 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                 // For computed entries:
                 auto data_type = _loader->GetDataType();
                 auto equivalent_type = data_type; // for FITS only, for rescaled data
-                casacore::String image_type(image->imageType());
                 bool use_image_for_entries(false);
+
+                // A transposed view: take the headers from the wrapped image and renumber their axis keywords
+                std::vector<int> header_axis_map; // file axis -> image axis, when renumbering is needed
+                auto header_image = image;
+                if (auto transposed = std::dynamic_pointer_cast<TransposedImage>(image)) {
+                    header_image = transposed->Inner();
+                    header_axis_map = transposed->InverseOrder();
+                }
+                casacore::String image_type(header_image->imageType());
+                auto renumber = [&](casacore::Vector<casacore::String>& headers) {
+                    if (!header_axis_map.empty()) {
+                        TransposedImage::RenumberHeaderCards(headers, header_axis_map);
+                    }
+                };
+
                 if (image_type == "FITSImage") {
                     // casacore FitsKeywordList has incomplete header names (no n on CRVALn, CDELTn, CROTA, etc.) so read with fitsio
-                    casacore::FITSImage* fits_image = dynamic_cast<casacore::FITSImage*>(image.get());
+                    casacore::FITSImage* fits_image = dynamic_cast<casacore::FITSImage*>(header_image.get());
                     casacore::String filename(fits_image->name());
                     equivalent_type = fits_image->dataType();
                     casacore::Vector<casacore::String> headers = FitsHeaderStrings(filename, FileInfo::GetFitsHdu(hdu));
+                    renumber(headers);
 
                     if (headers.empty()) {
                         // Found unsupported headers
@@ -176,13 +212,15 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                         AddEntriesFromHeaderStrings(headers, hdu, extended_info);
                     }
                 } else if (image_type == "CartaFitsImage") {
-                    CartaFitsImage* fits_image = dynamic_cast<CartaFitsImage*>(image.get());
+                    CartaFitsImage* fits_image = dynamic_cast<CartaFitsImage*>(header_image.get());
                     equivalent_type = fits_image->dataType();
                     casacore::Vector<casacore::String> headers = fits_image->FitsHeaderStrings();
+                    renumber(headers);
                     AddEntriesFromHeaderStrings(headers, hdu, extended_info);
                 } else if (image_type == "CartaHdf5Image") {
-                    CartaHdf5Image* hdf5_image = dynamic_cast<CartaHdf5Image*>(image.get());
+                    CartaHdf5Image* hdf5_image = dynamic_cast<CartaHdf5Image*>(header_image.get());
                     casacore::Vector<casacore::String> headers = hdf5_image->FitsHeaderStrings();
+                    renumber(headers);
                     AddEntriesFromHeaderStrings(headers, hdu, extended_info);
                 } else {
                     // Get image headers in FITS format using casacore ImageHeaderToFITS

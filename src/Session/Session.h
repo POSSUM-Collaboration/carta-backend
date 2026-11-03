@@ -228,10 +228,12 @@ public:
 protected:
     // File info for file list (extended info for each hdu_name)
     bool FillExtendedFileInfo(std::map<std::string, CARTA::FileInfoExtended>& hdu_info_map, CARTA::FileInfo& file_info,
-        const std::string& folder, const std::string& filename, const std::string& hdu, bool support_aips_beam, std::string& message);
+        const std::string& folder, const std::string& filename, const std::string& hdu, bool support_aips_beam, std::string& message,
+        const std::vector<int>& axis_order = {});
     // File info for open file
     bool FillExtendedFileInfo(CARTA::FileInfoExtended& extended_info, CARTA::FileInfo& file_info, const std::string& folder,
-        const std::string& filename, std::string& hdu_name, bool support_aips_beam, std::string& message, std::string& fullname);
+        const std::string& filename, std::string& hdu_name, bool support_aips_beam, std::string& message, std::string& fullname,
+        const std::vector<int>& axis_order = {});
     bool FillFileInfo(
         CARTA::FileInfo& file_info, const std::string& folder, const std::string& filename, std::string& fullname, std::string& message);
 

@@ -24,6 +24,7 @@
 #include "ImagePtrLoader.h"
 #include "MiriadLoader.h"
 #include "PolarizationCalculator.h"
+#include "TransposedImage.h"
 
 using namespace carta;
 
@@ -92,8 +93,40 @@ bool FileLoader::CanOpenFile(std::string& /*error*/) {
     return true;
 }
 
+void FileLoader::SetAxisOrder(const std::vector<int>& axis_order) {
+    _axis_order = axis_order;
+}
+
+bool FileLoader::IsTransposed() const {
+    return !_axis_order.empty() && !TransposedImage::IsIdentityOrder(_axis_order);
+}
+
 void FileLoader::OpenFile(const std::string& hdu) {
     AllocateImage(hdu);
+
+    // Apply (or update, or remove) the axis permutation as a lazy view over the loader's image
+    if (_image) {
+        auto transposed = std::dynamic_pointer_cast<TransposedImage>(_image);
+        bool want_transposed = IsTransposed();
+        bool rewrap = want_transposed ? (!transposed || transposed->AxisOrder() != _axis_order) : (transposed != nullptr);
+
+        if (rewrap) {
+            auto inner = transposed ? transposed->Inner() : _image;
+            if (want_transposed) {
+                if (!TransposedImage::IsValidOrder(_axis_order, inner->ndim())) {
+                    throw(casacore::AipsError(
+                        fmt::format("Axis order must list each of the {} image axes exactly once (0-based).", inner->ndim())));
+                }
+                _image = std::make_shared<TransposedImage>(inner, _axis_order);
+            } else {
+                _image = inner;
+            }
+            _image_shape = _image->shape();
+            _num_dims = _image_shape.size();
+            _coord_sys =
+                std::shared_ptr<casacore::CoordinateSystem>(static_cast<casacore::CoordinateSystem*>(_image->coordinates().clone()));
+        }
+    }
 
     // Normalize the upper/lower cases of BUNIT string from header
     if (_image) {
@@ -759,6 +792,8 @@ void FileLoader::LoadStats3DPercent() {
 }
 
 void FileLoader::LoadImageStats(bool load_percentiles) {
+    // Always size the per-plane stats (callers index them); for a permuted view HasData() reports no precomputed
+    // statistics, since those are stored per plane of the file's own axes, so they stay empty and are computed on demand
     _z_stats.resize(_dims.num_stokes);
     for (size_t s = 0; s < _dims.num_stokes; s++) {
         _z_stats[s].resize(_dims.depth);

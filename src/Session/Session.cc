@@ -176,7 +176,8 @@ void Session::ConnectCalled() {
 // File browser info
 
 bool Session::FillExtendedFileInfo(std::map<std::string, CARTA::FileInfoExtended>& hdu_info_map, CARTA::FileInfo& file_info,
-    const std::string& folder, const std::string& filename, const std::string& hdu, bool support_aips_beam, std::string& message) {
+    const std::string& folder, const std::string& filename, const std::string& hdu, bool support_aips_beam, std::string& message,
+    const std::vector<int>& axis_order) {
     // Fill CARTA::FileInfo and CARTA::FileInfoExtended
     // Map all hdus if no hdu_name supplied and FITS image
     bool file_info_ok(false);
@@ -195,6 +196,7 @@ bool Session::FillExtendedFileInfo(std::map<std::string, CARTA::FileInfoExtended
             return file_info_ok;
         }
         loader->SetAipsBeamSupport(support_aips_beam);
+        loader->SetAxisOrder(axis_order);
         FileExtInfoLoader ext_info_loader(loader);
 
         std::string requested_hdu(hdu);
@@ -234,7 +236,8 @@ bool Session::FillExtendedFileInfo(std::map<std::string, CARTA::FileInfoExtended
 }
 
 bool Session::FillExtendedFileInfo(CARTA::FileInfoExtended& extended_info, CARTA::FileInfo& file_info, const std::string& folder,
-    const std::string& filename, std::string& hdu, bool support_aips_beam, std::string& message, std::string& fullname) {
+    const std::string& filename, std::string& hdu, bool support_aips_beam, std::string& message, std::string& fullname,
+    const std::vector<int>& axis_order) {
     // Fill FileInfoExtended for given file and hdu_name (may include extension name)
     bool file_info_ok(false);
 
@@ -251,6 +254,7 @@ bool Session::FillExtendedFileInfo(CARTA::FileInfoExtended& extended_info, CARTA
             return file_info_ok;
         }
         loader->SetAipsBeamSupport(support_aips_beam);
+        loader->SetAxisOrder(axis_order);
         FileExtInfoLoader ext_info_loader = FileExtInfoLoader(loader);
 
         // Discern hdu for extended file info
@@ -426,8 +430,9 @@ void Session::OnFileInfoRequest(const CARTA::FileInfoRequest& request, uint32_t 
     auto& file_info = *response.mutable_file_info();
     std::map<std::string, CARTA::FileInfoExtended> extended_info_map;
     string message;
+    std::vector<int> axis_order(request.axis_order().begin(), request.axis_order().end());
     bool success = FillExtendedFileInfo(
-        extended_info_map, file_info, request.directory(), request.file(), request.hdu(), request.support_aips_beam(), message);
+        extended_info_map, file_info, request.directory(), request.file(), request.hdu(), request.support_aips_beam(), message, axis_order);
 
     if (success) {
         // add extended info map to message
@@ -502,8 +507,9 @@ bool Session::OnOpenFile(const CARTA::OpenFile& message, uint32_t request_id, bo
         // Set _loader and get file info
         CARTA::FileInfo file_info;
         CARTA::FileInfoExtended file_info_extended;
-        bool info_loaded =
-            FillExtendedFileInfo(file_info_extended, file_info, directory, filename, hdu, support_aips_beam, err_message, fullname);
+        std::vector<int> axis_order(message.axis_order().begin(), message.axis_order().end());
+        bool info_loaded = FillExtendedFileInfo(
+            file_info_extended, file_info, directory, filename, hdu, support_aips_beam, err_message, fullname, axis_order);
 
         if (info_loaded) {
             // Get or create loader for frame

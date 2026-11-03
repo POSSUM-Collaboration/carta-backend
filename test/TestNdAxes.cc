@@ -305,3 +305,162 @@ TEST_F(NdAxesTest, FileInfoDescribesAllAxes) {
     ASSERT_EQ(info.axes(2).world_values_size(), 6);
     EXPECT_DOUBLE_EQ(info.axes(2).world_values(2), 1.4e9 + 2e6);
 }
+
+// ---------------------------------------------------------------------------
+// Transposed views: any file axis can be rendered or animated
+
+#include "ImageData/TransposedImage.h"
+
+TEST_F(NdAxesTest, RenumberAxisKeywords) {
+    // file axes [RA, DEC, FREQ] shown as [RA, FREQ, DEC]: order = {0, 2, 1}, inverse = {0, 2, 1}
+    std::vector<int> inverse = {0, 2, 1};
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("CTYPE3", inverse), "CTYPE2");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("CTYPE2", inverse), "CTYPE3");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("CRVAL1", inverse), "CRVAL1");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("NAXIS3", inverse), "NAXIS2");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("NAXIS", inverse), "NAXIS");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("CUNIT3A", inverse), "CUNIT2A");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("PC1_3", inverse), "PC1_2");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("CD3_2", inverse), "CD2_3");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("PV3_1", inverse), "PV2_1");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("BUNIT", inverse), "BUNIT");
+    EXPECT_EQ(TransposedImage::RenumberAxisKeyword("CTYPE9", inverse), "CTYPE9"); // no such axis: unchanged
+
+    casacore::Vector<casacore::String> cards(2);
+    cards(0) = "CTYPE3  = 'FREQ    '           / frequency                                      ";
+    cards(1) = "NAXIS2  =                   10                                                  ";
+    TransposedImage::RenumberHeaderCards(cards, inverse);
+    EXPECT_EQ(std::string(cards(0)).substr(0, 8), "CTYPE2  ");
+    EXPECT_EQ(std::string(cards(0)).substr(8, 12), "= 'FREQ    '");
+    EXPECT_EQ(std::string(cards(1)).substr(0, 8), "NAXIS3  ");
+
+    EXPECT_TRUE(TransposedImage::IsValidOrder({2, 0, 1}, 3));
+    EXPECT_FALSE(TransposedImage::IsValidOrder({2, 0, 0}, 3));
+    EXPECT_FALSE(TransposedImage::IsValidOrder({0, 1}, 3));
+    EXPECT_TRUE(TransposedImage::IsIdentityOrder({0, 1, 2}));
+    EXPECT_TRUE(TransposedImage::IsIdentityOrder({}));
+    EXPECT_FALSE(TransposedImage::IsIdentityOrder({1, 0}));
+}
+
+TEST_F(NdAxesTest, TransposedViewRendersAnyAxes) {
+    // Show the 5D cube [RA, DEC, FREQ, STOKES, TIME] as [RA, FREQ, DEC, STOKES, TIME]: FREQ on y, DEC animated
+    auto path = GeneratedPath("ra_dec_freq_stokes_time.fits").string();
+    auto loader = FileLoader::GetLoader(path);
+    const std::vector<int> order = {0, 2, 1, 3, 4};
+    loader->SetAxisOrder(order);
+    loader->OpenFile("0");
+    auto image = loader->GetImage();
+    ASSERT_TRUE(image);
+    EXPECT_EQ(image->imageType(), "TransposedImage");
+    EXPECT_EQ(image->shape(), casacore::IPosition(5, 12, 6, 10, 3, 5));
+    EXPECT_TRUE(image->coordinates().hasDirectionCoordinate());
+    EXPECT_EQ(image->coordinates().directionAxesNumbers()(0), 0);
+    EXPECT_EQ(image->coordinates().directionAxesNumbers()(1), 2);
+    EXPECT_EQ(image->coordinates().spectralAxisNumber(), 1);
+    EXPECT_EQ(image->coordinates().polarizationAxisNumber(), 3);
+
+    std::string message;
+    ASSERT_TRUE(loader->FindCoordinateAxes(message)) << message;
+    auto axes = loader->GetAxes();
+    EXPECT_EQ(axes.x, 0);
+    EXPECT_EQ(axes.y, 1);
+    EXPECT_EQ(axes.z, 2);
+    EXPECT_EQ(axes.spatial_x, 0);
+    EXPECT_EQ(axes.spatial_y, 2);
+    EXPECT_EQ(axes.spectral, 1);
+    EXPECT_EQ(axes.stokes, 3);
+    EXPECT_EQ(axes.extra, std::vector<int>({4}));
+    EXPECT_EQ(loader->GetDims().width, 12);
+    EXPECT_EQ(loader->GetDims().height, 6);
+    EXPECT_EQ(loader->GetDims().depth, 10);
+
+    // Every pixel of a rendered plane carries the file index it came from
+    Frame frame(0, loader, "0");
+    ASSERT_TRUE(frame.IsValid()) << frame.GetErrorMessage();
+    ASSERT_TRUE(frame.SetImageChannels(7, 2, {3}, message)) << message; // DEC index 7, Stokes 2, TIME 3
+    auto stokes_slicer = frame.GetImageSlicer(AxisRange(frame.CurrentZ()), frame.CurrentStokes());
+    std::vector<float> plane(stokes_slicer.slicer.length().product());
+    ASSERT_TRUE(frame.GetSlicerData(stokes_slicer, plane.data()));
+    ASSERT_EQ(plane.size(), 12 * 6);
+    for (long y = 0; y < 6; ++y) {
+        for (long x = 0; x < 12; ++x) {
+            // file index: RA = x, DEC = 7, FREQ = y, STOKES = 2, TIME = 3
+            float expected = EncodedValue({x, 7, y, 2, 3});
+            ASSERT_FLOAT_EQ(plane[y * 12 + x], expected) << "pixel " << x << "," << y;
+        }
+    }
+
+    // Per-plane stats are sized for the view (no precomputed values) and the histogram is computed from the data
+    loader->LoadImageStats(false);
+    EXPECT_FALSE(loader->GetImageStats(2, 7).valid);
+    bool histogram_sent(false);
+    ASSERT_TRUE(frame.FillRegionHistogramData(
+        [&](CARTA::RegionHistogramData histogram_data) {
+            histogram_sent = true;
+            EXPECT_EQ(histogram_data.channel(), 7);
+            EXPECT_EQ(histogram_data.stokes(), 2);
+            EXPECT_GT(histogram_data.histograms().num_bins(), 0);
+        },
+        IMAGE_REGION_ID, 0, true));
+    EXPECT_TRUE(histogram_sent);
+
+    // Direct slice through the view, with a stride, against the file
+    casacore::Array<float> data;
+    casacore::IPosition start(5, 2, 1, 4, 1, 0), end(5, 8, 5, 4, 1, 4), stride(5, 3, 2, 1, 1, 2);
+    image->doGetSlice(data, casacore::Slicer(start, end, stride, casacore::Slicer::endIsLast));
+    ASSERT_EQ(data.shape(), casacore::IPosition(5, 3, 3, 1, 1, 3));
+    EXPECT_FLOAT_EQ(data(casacore::IPosition(5, 1, 2, 0, 0, 2)), EncodedValue({5, 4, 5, 1, 4}));
+
+    // File info reflects the view: headers renumbered, axes numbers in image order
+    FileExtInfoLoader ext_info_loader(loader);
+    std::map<std::string, CARTA::FileInfoExtended> info_map;
+    ASSERT_TRUE(ext_info_loader.FillFitsFileInfoMap(info_map, path, message)) << message;
+    const auto& info = info_map.begin()->second;
+    std::map<std::string, std::string> headers;
+    for (int i = 0; i < info.header_entries_size(); ++i) {
+        headers[info.header_entries(i).name()] = info.header_entries(i).value();
+    }
+    EXPECT_EQ(headers["CTYPE2"], "FREQ");
+    EXPECT_EQ(headers["CTYPE3"], "DEC--SIN");
+    EXPECT_EQ(headers["NAXIS2"], "6");
+    EXPECT_EQ(headers["NAXIS3"], "10");
+    EXPECT_EQ(headers["CUNIT2"], "Hz");
+    EXPECT_EQ(info.width(), 12);
+    EXPECT_EQ(info.height(), 6);
+    EXPECT_EQ(info.depth(), 10);
+    EXPECT_EQ(info.axes_numbers().spatial_x(), 1);
+    EXPECT_EQ(info.axes_numbers().spatial_y(), 3);
+    EXPECT_EQ(info.axes_numbers().spectral(), 2);
+    EXPECT_EQ(info.axes_numbers().stokes(), 4);
+    ASSERT_EQ(info.axes_size(), 5);
+    EXPECT_EQ(info.axes(1).ctype(), "FREQ");
+    EXPECT_EQ(info.axes(1).role(), CARTA::AxisRole::AxisY);
+    EXPECT_EQ(info.axes(2).ctype(), "DEC--SIN");
+    EXPECT_EQ(info.axes(2).role(), CARTA::AxisRole::AxisZ);
+
+    // Back to file order: the view is removed
+    loader->SetAxisOrder({});
+    loader->OpenFile("0");
+    EXPECT_NE(loader->GetImage()->imageType(), "TransposedImage");
+    EXPECT_EQ(loader->GetImage()->shape(), casacore::IPosition(5, 12, 10, 6, 3, 5));
+}
+
+TEST_F(NdAxesTest, InvalidAxisOrderIsRejected) {
+    auto path = GeneratedPath("ra_dec_fdep.fits").string();
+    auto loader = FileLoader::GetLoader(path);
+    loader->SetAxisOrder({0, 0, 1});
+    EXPECT_THROW(loader->OpenFile("0"), casacore::AipsError);
+    loader->SetAxisOrder({2, 1});
+    EXPECT_THROW(loader->OpenFile("0"), casacore::AipsError);
+
+    // A valid order with an extra axis moved to the front works, and a Frame can be made from it
+    loader->SetAxisOrder({2, 0, 1});
+    loader->OpenFile("0");
+    std::string message;
+    ASSERT_TRUE(loader->FindCoordinateAxes(message)) << message;
+    EXPECT_EQ(loader->GetDims().width, 8);   // FDEP
+    EXPECT_EQ(loader->GetDims().height, 12); // RA
+    EXPECT_EQ(loader->GetDims().depth, 10);  // DEC
+    Frame frame(0, loader, "0");
+    EXPECT_TRUE(frame.IsValid()) << frame.GetErrorMessage();
+}

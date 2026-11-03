@@ -60,11 +60,15 @@ void Hdf5Loader::AllocateImage(const std::string& hdu) {
 }
 
 bool Hdf5Loader::HasData(std::string ds_name) const {
-    if (!_image) {
+    if (!_image || IsTransposed()) {
+        // Auxiliary datasets (stats, mipmaps, swizzled data) describe the file's own axis order only
         return false;
     }
 
     CartaHdf5Image* hdf5_image = dynamic_cast<CartaHdf5Image*>(_image.get());
+    if (!hdf5_image) {
+        return false;
+    }
     auto group_ptr = hdf5_image->Group();
     return casacore::HDF5Group::exists(*group_ptr, ds_name);
 }
@@ -152,7 +156,7 @@ std::string Hdf5Loader::DataSetToString(FileInfo::Data ds) const {
 }
 
 bool Hdf5Loader::HasMip(int mip) const {
-    return _mipmaps.find(mip) != _mipmaps.end();
+    return !IsTransposed() && (_mipmaps.find(mip) != _mipmaps.end());
 }
 
 // TODO: The datatype used to create the HDF5DataSet has to match the native type exactly, but the data can be read into an array of the
@@ -517,7 +521,7 @@ bool Hdf5Loader::GetChunk(
 }
 
 bool Hdf5Loader::UseTileCache() const {
-    return _layout == H5D_CHUNKED;
+    return !IsTransposed() && (_layout == H5D_CHUNKED);
 }
 
 } // namespace carta

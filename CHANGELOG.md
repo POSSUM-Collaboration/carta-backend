@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 * Added support for images with any number of axes and any axis types: the first two non-Stokes axes are rendered, the next is the depth (channel) axis, Stokes is used only when the image has a polarization coordinate, and every further axis is pinned at a current index (`Frame::SetExtraAxisIndices`). Removes the 2D/3D/4D limit; the shape-based Stokes guess for 4D images now applies only to axes with no coordinate type at all.
+* Added selectable render axes: `FileInfoRequest.axis_order` and `OpenFile.axis_order` present an image with its file axes permuted (`TransposedImage`, a lazy read-only view), so any pair of axes can be rendered and any other animated. File-info headers are renumbered to the presented order; precomputed statistics and HDF5 mipmaps are bypassed for permuted views.
 
 ### Fixed
 * Fixed incorrect scientic notation parsing ([#1632](https://github.com/CARTAvis/carta-backend/issues/1632)). 

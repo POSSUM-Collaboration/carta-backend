@@ -56,6 +56,14 @@ public:
     virtual bool CanOpenFile(std::string& error);
     // Open and close file
     virtual void OpenFile(const std::string& hdu);
+
+    // Present the image with its axes permuted (image axis i = file axis order[i]); empty = file order.
+    // Takes effect on the next OpenFile; an already open image is re-wrapped.
+    void SetAxisOrder(const std::vector<int>& axis_order);
+    const std::vector<int>& GetAxisOrder() const {
+        return _axis_order;
+    }
+    bool IsTransposed() const;
     // Check to see if the file has a particular HDU/group/table/etc
     virtual bool HasData(FileInfo::Data ds) const;
 
@@ -165,6 +173,9 @@ protected:
     // Computed stokes image
     std::shared_ptr<casacore::ImageInterface<float>> _computed_stokes_image;
     StokesSource _stokes_source;
+
+    // Axis permutation applied to the opened image (see SetAxisOrder)
+    std::vector<int> _axis_order;
 
     // Save image properties
     casacore::IPosition _image_shape;
