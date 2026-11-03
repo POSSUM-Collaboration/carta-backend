@@ -1,0 +1,396 @@
+# Builds downloadable binaries of this backend branch together with the matching carta-frontend branch:
+#   * a GitHub pre-release "build-<branch>" with Linux tarballs (amd64 and arm64) and the frontend bundle
+#   * a multi-arch Docker image ghcr.io/<owner>/carta:<branch> (backend + frontend, ready to run)
+# Runs on every push to dev and feature/* branches, or by hand (Actions -> "Build binaries" -> Run workflow).
+# The frontend is taken from the branch of the same name in the frontend fork, falling back to dev.
+
+name: Build binaries
+
+on:
+  push:
+    branches:
+      - dev
+      - feature/**
+  workflow_dispatch:
+    inputs:
+      frontend_ref:
+        description: "carta-frontend branch or tag to bundle (default: same branch name as this one, else dev)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  FRONTEND_REPO: POSSUM-Collaboration/carta-frontend
+
+jobs:
+  resolve:
+    name: Resolve branch names
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.names.outputs.slug }}
+      frontend_ref: ${{ steps.names.outputs.frontend_ref }}
+      image: ${{ steps.names.outputs.image }}
+    steps:
+      - name: Derive the build slug, the frontend ref and the image name
+        id: names
+        env:
+          FRONTEND_REF_INPUT: ${{ github.event.inputs.frontend_ref }}
+        run: |
+          slug="${GITHUB_REF_NAME//\//-}"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+          ref="$FRONTEND_REF_INPUT"
+          if [ -z "$ref" ]; then
+            if git ls-remote --exit-code --heads "https://github.com/${FRONTEND_REPO}.git" "refs/heads/${GITHUB_REF_NAME}" > /dev/null; then
+              ref="$GITHUB_REF_NAME"
+            else
+              ref="dev"
+            fi
+          fi
+          echo "frontend_ref=$ref" >> "$GITHUB_OUTPUT"
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=ghcr.io/${owner}/carta" >> "$GITHUB_OUTPUT"
+          echo "Build slug: $slug | frontend: $ref | image: ghcr.io/${owner}/carta"
+
+  frontend:
+    name: Frontend (${{ needs.resolve.outputs.frontend_ref }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    container:
+      image: carta/frontend-builder
+      options: --security-opt seccomp=unconfined
+    steps:
+      - name: Checkout carta-frontend
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.FRONTEND_REPO }}
+          ref: ${{ needs.resolve.outputs.frontend_ref }}
+          submodules: recursive
+          path: frontend
+
+      - name: Fix ownership
+        run: |
+          chown -R $(id -u):$(id -g) "$PWD"
+          git config --global --add safe.directory '*'
+
+      - name: Use precompiled WASM libraries
+        shell: bash
+        working-directory: frontend
+        run: |
+          set -e
+          cp -a /opt/carta/wasm_libs/built ./wasm_libs/
+          mkdir -p ./wasm_libs/zstd/build
+          cp /opt/carta/wasm_libs/zstd/build/standalone_zstd.a ./wasm_libs/zstd/build/
+          test -s ./wasm_libs/built/lib/libast.a
+          test -s ./wasm_libs/built/lib/libgsl.a
+          test -s ./wasm_libs/built/lib/libgslcblas.a
+          test -s ./wasm_libs/built/lib/libzfp.a
+          test -s ./wasm_libs/zstd/build/standalone_zstd.a
+
+      - name: npm install with node 22
+        shell: bash
+        working-directory: frontend
+        run: |
+          n 22
+          n exec 22 node -v
+          n exec 22 npm install
+
+      - name: Production build with node 22
+        shell: bash
+        working-directory: frontend
+        run: |
+          source /emsdk/emsdk_env.sh
+          export PATH="$(dirname "$(find /usr/local/n/versions/node -path '*/22.*/bin/node' -print -quit)"):$PATH"
+          node -v
+          npm run build
+          test -s build/index.html
+
+      - name: Record the frontend commit
+        shell: bash
+        working-directory: frontend
+        run: |
+          git rev-parse HEAD > build/FRONTEND_COMMIT
+          echo "${{ needs.resolve.outputs.frontend_ref }}" > build/FRONTEND_REF
+
+      - name: Pack
+        shell: bash
+        run: |
+          tar -C frontend -czf "carta-frontend-${{ needs.resolve.outputs.slug }}.tar.gz" build
+
+      - name: Upload frontend bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-bundle
+          path: carta-frontend-${{ needs.resolve.outputs.slug }}.tar.gz
+          if-no-files-found: error
+
+  backend:
+    name: Backend (linux/${{ matrix.arch }})
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true # one architecture failing must not block the other
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check out the protobuf submodule only (the test data submodule would fetch Git LFS objects)
+        run: git submodule update --init carta-protobuf
+
+      - name: Install build dependencies (as in Dockerfiles/Dockerfile-ubuntu-24.04)
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            autoconf bison build-essential ccache cmake curl flex gcc g++ gfortran git \
+            libblas-dev libcfitsio-dev libfftw3-dev libgsl-dev libhdf5-dev libhealpix-cxx-dev \
+            liblapack-dev libncurses-dev libprotobuf-dev libreadline-dev libssl-dev \
+            libstarlink-ast-dev libtool libxml2-dev libxslt1-dev libzfp-dev libzstd-dev \
+            pkg-config protobuf-compiler software-properties-common unzip uuid-dev wcslib-dev wget
+          sudo add-apt-repository -y ppa:cartavis-team/carta-preview
+          sudo apt-get update
+          sudo apt-get install -y carta-casacore-dev
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.arch }}-${{ needs.resolve.outputs.slug }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.arch }}-${{ needs.resolve.outputs.slug }}-
+            ccache-${{ matrix.arch }}-
+
+      - name: Build backend
+        run: |
+          cmake --version
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build -j "$(nproc)"
+          ccache -s
+          ./build/carta_backend --version
+
+      - name: Stage the installation tree
+        run: |
+          cmake --install build --prefix stage/carta
+          # Packages providing the shared libraries the binary needs, for the runtime image and the tarball README
+          ldd build/carta_backend | awk '/=> \//{print $3}' | xargs -r dpkg -S 2>/dev/null | cut -d: -f1 | sort -u > stage/carta/runtime-packages.txt
+          git rev-parse HEAD > stage/carta/BACKEND_COMMIT
+          cat stage/carta/runtime-packages.txt
+          find stage -type f | sort
+
+      - name: Upload backend tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-${{ matrix.arch }}
+          path: stage
+          if-no-files-found: error
+
+  docker:
+    name: Docker image (linux/${{ matrix.arch }})
+    needs: [resolve, frontend, backend]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    steps:
+      - name: Checkout (for the Dockerfile)
+        uses: actions/checkout@v6
+
+      - name: Download backend tree
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-${{ matrix.arch }}
+          path: image
+
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-bundle
+          path: image
+
+      - name: Assemble the image context
+        run: |
+          mkdir -p image/carta/share/carta
+          tar -C image -xzf image/carta-frontend-*.tar.gz
+          rm -rf image/carta/share/carta/frontend
+          mv image/build image/carta/share/carta/frontend
+          rm image/carta-frontend-*.tar.gz
+          chmod +x image/carta/bin/*
+          cp Dockerfiles/Dockerfile-release image/Dockerfile
+          find image -maxdepth 4 | sort | head -40
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: image
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=CARTA (POSSUM fork) ${{ github.ref_name }} backend + frontend ${{ needs.resolve.outputs.frontend_ref }}
+          outputs: type=image,name=${{ needs.resolve.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  docker-manifest:
+    name: Multi-arch image tag
+    needs: [resolve, docker]
+    if: ${{ !cancelled() && needs.docker.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create the manifest list
+        working-directory: digests
+        run: |
+          image="${{ needs.resolve.outputs.image }}"
+          tag="${{ needs.resolve.outputs.slug }}"
+          docker buildx imagetools create -t "${image}:${tag}" -t "${image}:${tag}-${GITHUB_SHA::8}" \
+            $(printf "${image}@sha256:%s " *)
+          docker buildx imagetools inspect "${image}:${tag}"
+          echo "Docker image: ${image}:${tag}" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Pre-release with tarballs
+    needs: [resolve, frontend, backend]
+    if: ${{ !cancelled() && needs.frontend.result == 'success' && needs.backend.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble tarballs
+        env:
+          SLUG: ${{ needs.resolve.outputs.slug }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          FRONTEND_REF: ${{ needs.resolve.outputs.frontend_ref }}
+        run: |
+          set -e
+          mkdir -p dist
+          cp artifacts/frontend-bundle/carta-frontend-*.tar.gz dist/
+          for tree in artifacts/backend-*; do
+            [ -d "$tree/carta" ] || continue
+            arch="${tree##*backend-}"
+            work="work-$arch"
+            rm -rf "$work" && mkdir -p "$work"
+            cp -a "$tree/carta" "$work/carta"
+            chmod +x "$work"/carta/bin/*
+            mkdir -p "$work/carta/share/carta"
+            tar -C "$work" -xzf dist/carta-frontend-*.tar.gz
+            mv "$work/build" "$work/carta/share/carta/frontend"
+            cat > "$work/carta/README.txt" <<EOF
+          CARTA (POSSUM-Collaboration fork) — branch ${GITHUB_REF_NAME}, Linux ${arch}
+          backend commit $(cat "$work/carta/BACKEND_COMMIT"), frontend ${FRONTEND_REF} commit $(cat "$work/carta/share/carta/frontend/FRONTEND_COMMIT")
+
+          Built on Ubuntu 24.04. To run on Ubuntu 24.04 (or a close derivative):
+
+            sudo add-apt-repository ppa:cartavis-team/carta-preview
+            sudo apt-get update
+            sudo apt-get install \$(cat runtime-packages.txt)
+            ./bin/carta_backend --no_browser /path/to/images
+
+          then open the URL the backend prints (http://localhost:3002/?token=...).
+          The frontend in share/carta/frontend is found automatically relative to bin/carta_backend.
+
+          Any Linux or macOS machine with Docker can instead run the matching image:
+
+            docker run --rm -p 3002:3002 -v /path/to/images:/images ${IMAGE}:${SLUG}
+          EOF
+            tar -C "$work" -czf "dist/carta-${SLUG}-linux-${arch}.tar.gz" carta
+          done
+          ls -la dist
+          ls dist/carta-*-linux-*.tar.gz > /dev/null # at least one backend build must have succeeded
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+
+      - name: Write release notes
+        env:
+          SLUG: ${{ needs.resolve.outputs.slug }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          FRONTEND_REF: ${{ needs.resolve.outputs.frontend_ref }}
+        run: |
+          frontend_commit=$(tar -xzOf dist/carta-frontend-*.tar.gz build/FRONTEND_COMMIT)
+          cat > notes.md <<EOF
+          Automated build of branch \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA} with carta-frontend \`${FRONTEND_REF}\` at ${frontend_commit}.
+          This tag moves to the latest build of the branch; it is not a versioned release.
+
+          **Run with Docker (Linux, macOS incl. Apple Silicon, Windows with Docker Desktop):**
+
+              docker run --rm -p 3002:3002 -v /path/to/images:/images ${IMAGE}:${SLUG}
+
+          then open the URL printed by the backend (http://localhost:3002/?token=...).
+
+          **Run natively on Ubuntu 24.04:** download \`carta-${SLUG}-linux-<arch>.tar.gz\`, unpack it and follow \`carta/README.txt\`
+          (add the \`ppa:cartavis-team/carta-preview\` PPA and install the packages listed in \`runtime-packages.txt\`).
+
+          \`carta-frontend-${SLUG}.tar.gz\` is the frontend bundle alone, for serving with an existing backend
+          (\`carta_backend --frontend_folder <unpacked build dir>\`).
+          EOF
+          cat notes.md
+
+      - name: Publish the pre-release (replacing the previous build of this branch)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SLUG: ${{ needs.resolve.outputs.slug }}
+        run: |
+          tag="build-${SLUG}"
+          gh release delete "$tag" --cleanup-tag --yes || true
+          gh release create "$tag" --prerelease --target "$GITHUB_SHA" \
+            --title "Build of ${GITHUB_REF_NAME} ($(date -u +%Y-%m-%d))" --notes-file notes.md \
+            dist/*
+          echo "Release: https://github.com/${GH_REPO}/releases/tag/${tag}" >> "$GITHUB_STEP_SUMMARY"
