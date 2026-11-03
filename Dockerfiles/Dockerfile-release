@@ -1,0 +1,31 @@
+# Runtime image assembled by .github/workflows/build_binaries.yml from a prebuilt backend (Ubuntu 24.04 build)
+# and a prebuilt frontend. The build context is a directory containing:
+#   carta/bin/carta_backend, carta/bin/carta, carta/share/carta/frontend/, carta/share/carta/default.fits,
+#   carta/runtime-packages.txt (Ubuntu packages providing the libraries the binary links against)
+#
+#   docker run --rm -p 3002:3002 -v /path/to/images:/images ghcr.io/possum-collaboration/carta:<branch>
+# then open the URL the backend prints (http://localhost:3002/?token=...).
+
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+COPY carta/runtime-packages.txt /tmp/runtime-packages.txt
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates software-properties-common && \
+    add-apt-repository -y ppa:cartavis-team/carta-preview && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends $(cat /tmp/runtime-packages.txt) && \
+    (apt-get install -y --no-install-recommends casacore-data || true) && \
+    rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
+
+COPY carta/ /usr/local/
+
+ENV CARTA_DOCKER_DEPLOYMENT=1
+EXPOSE 3002
+VOLUME ["/images"]
+
+# The frontend is served from /usr/local/share/carta/frontend (the backend's default, relative to its binary)
+ENTRYPOINT ["/usr/local/bin/carta_backend", "--no_browser", "--port", "3002", "--top_level_folder", "/images"]
+CMD ["/images"]
