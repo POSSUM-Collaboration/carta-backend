@@ -92,6 +92,15 @@ else ()
     endif ()
 endif()
 
+PKG_SEARCH_MODULE(HEALPIX REQUIRED healpix_cxx)
+if (HEALPIX_FOUND)
+    message(STATUS "Found healpix_cxx using pkg-config")
+    include_directories(${HEALPIX_INCLUDE_DIRS})
+    link_directories(${HEALPIX_LIBRARY_DIRS})
+else ()
+    message(FATAL_ERROR "Could not find healpix_cxx")
+endif ()
+
 PKG_SEARCH_MODULE(UUID REQUIRED uuid)
 if (UUID_FOUND)
     message(STATUS "Found uuid using pkg-config")
@@ -198,6 +207,7 @@ set(LINK_LIBS
         zstd
         cfitsio
         wcs
+        ${HEALPIX_LIBRARIES}
         gsl
         nlohmann_json::nlohmann_json
         nlohmann_json_schema_validator
@@ -234,11 +244,13 @@ set(SOURCE_FILES
         src/HttpServer/HttpServer.cc
         src/ImageData/CartaFitsImage.cc
         src/ImageData/CartaHdf5Image.cc
+        src/ImageData/CartaHealpixImage.cc
         src/ImageData/CartaMiriadImage.cc
         src/ImageData/CompressedFits.cc
         src/ImageData/FileInfo.cc
         src/ImageData/FileLoader.cc
         src/ImageData/FitsLoader.cc
+        src/ImageData/HealpixLoader.cc
         src/ImageData/FitsUtil.cc
         src/ImageData/Hdf5Attributes.cc
         src/ImageData/Hdf5Loader.cc

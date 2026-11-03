@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+* Added support for HEALPix maps (FITS binary tables with PIXTYPE='HEALPIX'): maps are reprojected on the fly onto a regular grid (default all-sky Mollweide at the HEALPix resolution; any WCS projection, frame, centre and pixel scale; or the grid of another open image), with I/Q/U/V columns exposed as a Stokes axis. Requires the healpix_cxx library.
+
 ### Fixed
 * Fixed incorrect scientic notation parsing ([#1632](https://github.com/CARTAvis/carta-backend/issues/1632)). 
 * Fixed error importing incorrect region name from a CRTF region file ([#1626](https://github.com/CARTAvis/carta-backend/issues/1626)). 

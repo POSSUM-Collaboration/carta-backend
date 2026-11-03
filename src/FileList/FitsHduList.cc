@@ -64,7 +64,7 @@ void FitsHduList::CheckFitsHeaders(fitsfile* fptr, std::vector<std::string>& hdu
         std::string key;
         char* comment(nullptr); // unused
 
-        bool is_image(false), is_fz(false);
+        bool is_image(false), is_fz(false), is_healpix(false);
 
         if (hdu == 0) {
             // Check SIMPLE for primary header only; exit if false
@@ -91,11 +91,29 @@ void FitsHduList::CheckFitsHeaders(fitsfile* fptr, std::vector<std::string>& hdu
 
                 if (is_fz) {
                     is_image = true;
+                } else if (hdutype == BINARY_TBL) {
+                    // Check PIXTYPE for a HEALPix map (binary table extension)
+                    status = 0;
+                    key = "PIXTYPE";
+                    char pixtype[FLEN_VALUE];
+                    fits_read_key(fptr, TSTRING, key.c_str(), pixtype, comment, &status);
+                    is_healpix = (status == 0) && (std::string(pixtype).rfind("HEALPIX", 0) == 0);
                 }
             }
         }
 
-        if ((hdu == 0) || is_image) {
+        if (is_healpix) {
+            // Add HEALPix extension with NSIDE and ordering as its name
+            long nside(0);
+            status = 0;
+            key = "NSIDE";
+            fits_read_key(fptr, TLONG, key.c_str(), &nside, comment, &status);
+            char ordering[FLEN_VALUE] = "RING";
+            status = 0;
+            key = "ORDERING";
+            fits_read_key(fptr, TSTRING, key.c_str(), ordering, comment, &status);
+            hdu_list.push_back(fmt::format("{}: HEALPix NSIDE={} {}", hdu, nside, ordering));
+        } else if ((hdu == 0) || is_image) {
             // Check image dimensions for primary hdu or image extension
             key = (is_fz ? "ZNAXIS" : "NAXIS");
             int naxis(0);

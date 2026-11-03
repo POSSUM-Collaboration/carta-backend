@@ -46,6 +46,7 @@ set(TEST_SOURCES
         TestFitsTable.cc
         TestHdf5Attributes.cc
         TestHdf5Image.cc
+        TestHealpix.cc
         TestHistogram.cc
         TestImageFitting.cc
         TestMain.cc

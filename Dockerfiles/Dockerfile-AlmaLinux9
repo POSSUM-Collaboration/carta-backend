@@ -6,7 +6,7 @@ RUN \
   dnf -y install 'dnf-command(config-manager)' && \
   dnf -y config-manager --set-enabled crb && \
   dnf -y update && \
-  dnf -y install autoconf automake bison blas-devel bzip2 cfitsio-devel cmake curl-devel flex gcc \
+  dnf -y install autoconf automake bison blas-devel bzip2 cfitsio-devel healpix-c++-devel cmake curl-devel flex gcc \
          gcc-c++ git git-lfs gmock-devel gsl-devel gtest-devel hdf5-devel lapack-devel libasan \
          libtool libxml2-devel libzstd-devel libuuid-devel make openssl-devel protobuf-devel \
          python3 python3-pip readline-devel subversion \
