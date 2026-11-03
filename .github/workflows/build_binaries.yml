@@ -184,10 +184,12 @@ jobs:
       - name: Stage the installation tree
         run: |
           cmake --install build --prefix stage/carta
-          # Packages providing the shared libraries the binary needs, for the runtime image and the tarball README
-          ldd build/carta_backend | awk '/=> \//{print $3}' | xargs -r dpkg -S 2>/dev/null | cut -d: -f1 | sort -u > stage/carta/runtime-packages.txt
+          # Packages providing the shared libraries the binary needs, for the runtime image and the tarball README.
+          # ldd reports /lib/... paths but dpkg records them under /usr/lib (merged /usr), so resolve them first.
+          ldd build/carta_backend | awk '/=> \//{print $3}' | xargs -r readlink -f | xargs -r dpkg -S | cut -d: -f1 | sort -u > stage/carta/runtime-packages.txt
           git rev-parse HEAD > stage/carta/BACKEND_COMMIT
           cat stage/carta/runtime-packages.txt
+          test "$(wc -l < stage/carta/runtime-packages.txt)" -gt 10 # every library must map to a package
           find stage -type f | sort
 
       - name: Upload backend tree

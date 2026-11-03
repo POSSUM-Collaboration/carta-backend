@@ -22,6 +22,9 @@ RUN apt-get update && \
 
 COPY carta/ /usr/local/
 
+# Every shared library must resolve, and the binary must start
+RUN ! (ldd /usr/local/bin/carta_backend | grep "not found") && /usr/local/bin/carta_backend --version
+
 ENV CARTA_DOCKER_DEPLOYMENT=1
 EXPOSE 3002
 VOLUME ["/images"]
