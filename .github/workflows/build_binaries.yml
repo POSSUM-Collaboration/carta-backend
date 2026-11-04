@@ -175,7 +175,9 @@ jobs:
       - name: Build backend
         run: |
           cmake --version
+          # The installed binary must still find carta-casacore in /opt (the build-tree RPATH is stripped on install)
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH=/opt/carta-casacore/lib \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build build -j "$(nproc)"
           ccache -s
@@ -184,6 +186,7 @@ jobs:
       - name: Stage the installation tree
         run: |
           cmake --install build --prefix stage/carta
+          ! (ldd stage/carta/bin/carta_backend | grep "not found") # the installed copy must resolve every library
           # Packages providing the shared libraries the binary needs, for the runtime image and the tarball README.
           # ldd reports /lib/... paths but dpkg records them under /usr/lib (merged /usr), so resolve them first.
           ldd build/carta_backend | awk '/=> \//{print $3}' | xargs -r readlink -f | xargs -r dpkg -S | cut -d: -f1 | sort -u > stage/carta/runtime-packages.txt
