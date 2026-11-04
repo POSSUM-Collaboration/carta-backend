@@ -10,9 +10,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <list>
+#include <mutex>
+#include <unordered_map>
 
+#include <fcntl.h>
 #include <fitsio.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <casacore/casa/Arrays/Slice.h>
 #include <casacore/casa/Exceptions/Error.h>
@@ -22,10 +30,14 @@
 #include <casacore/casa/Quanta/UnitVal.h>
 #include <casacore/coordinates/Coordinates/LinearCoordinate.h>
 #include <casacore/coordinates/Coordinates/Projection.h>
+#include <casacore/coordinates/Coordinates/SpectralCoordinate.h>
 #include <casacore/coordinates/Coordinates/StokesCoordinate.h>
+#include <casacore/images/Images/ImageInfo.h>
 #include <casacore/measures/Measures/MCDirection.h>
+#include <casacore/measures/Measures/MFrequency.h>
 #include <casacore/measures/Measures/MeasConvert.h>
 #include <casacore/measures/Measures/Stokes.h>
+#include <casacore/scimath/Mathematics/GaussianBeam.h>
 
 #include <healpix_base.h>
 #include <pointing.h>
@@ -128,7 +140,218 @@ casacore::MDirection::Types FrameFromCode(const std::string& code, bool& ok) {
     return casacore::MDirection::ICRS;
 }
 
+bool IsBadValue(float v, float bad) {
+    return !std::isfinite(v) || v == bad || v < -1.0e30f;
+}
+
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Map sources: where the values of each map come from
+
+namespace carta {
+
+/**
+ * @brief Values of the maps of a HEALPix HDU, indexed by map (table column or image row) and HEALPix pixel.
+ * FullMap returns a whole map as a contiguous array when one is available cheaply (held or cached in memory);
+ * otherwise Value reads single pixels. Both must be safe to call from several threads at once.
+ */
+class HealpixMapSource {
+public:
+    virtual ~HealpixMapSource() = default;
+    virtual size_t NumMaps() const = 0;
+    virtual std::shared_ptr<const std::vector<float>> FullMap(size_t map) = 0;
+    virtual float Value(size_t map, int64_t pix) = 0;
+};
+
+namespace {
+
+// Maps held in memory (binary-table columns)
+class InMemoryMapSource : public HealpixMapSource {
+public:
+    explicit InMemoryMapSource(std::vector<std::shared_ptr<std::vector<float>>> maps) : _maps(std::move(maps)) {}
+    size_t NumMaps() const override {
+        return _maps.size();
+    }
+    std::shared_ptr<const std::vector<float>> FullMap(size_t map) override {
+        return map < _maps.size() ? _maps[map] : nullptr;
+    }
+    float Value(size_t map, int64_t pix) override {
+        if (map >= _maps.size() || pix < 0 || pix >= static_cast<int64_t>(_maps[map]->size())) {
+            return FLOAT_NAN;
+        }
+        return (*_maps[map])[pix];
+    }
+
+private:
+    std::vector<std::shared_ptr<std::vector<float>>> _maps;
+};
+
+// Image-format maps read directly from a memory-mapped uncompressed FITS file (BITPIX -32 or -64, big-endian)
+class MappedImageMapSource : public HealpixMapSource {
+public:
+    MappedImageMapSource(
+        const std::string& filename, long long data_offset, int bitpix, long npix, long num_maps, double bscale, double bzero, float bad)
+        : _npix(npix), _num_maps(num_maps), _bytes(std::abs(bitpix) / 8), _bscale(bscale), _bzero(bzero), _bad(bad) {
+        int fd = open(filename.c_str(), O_RDONLY);
+        if (fd < 0) {
+            throw(casacore::AipsError("Cannot open HEALPix file for mapping."));
+        }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size < data_offset + static_cast<long long>(_bytes) * npix * num_maps) {
+            close(fd);
+            throw(casacore::AipsError("HEALPix file is shorter than its header describes."));
+        }
+        _length = st.st_size;
+        void* base = mmap(nullptr, _length, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (base == MAP_FAILED) {
+            throw(casacore::AipsError("Cannot memory-map HEALPix file."));
+        }
+        _base = static_cast<const char*>(base);
+        _data = _base + data_offset;
+        const uint16_t one(1);
+        _swap = (*reinterpret_cast<const uint8_t*>(&one) == 1); // little-endian host, FITS data is big-endian
+    }
+    ~MappedImageMapSource() override {
+        if (_base) {
+            munmap(const_cast<char*>(_base), _length);
+        }
+    }
+    size_t NumMaps() const override {
+        return _num_maps;
+    }
+    std::shared_ptr<const std::vector<float>> FullMap(size_t) override {
+        return nullptr; // read per pixel from the mapping
+    }
+    float Value(size_t map, int64_t pix) override {
+        if (map >= static_cast<size_t>(_num_maps) || pix < 0 || pix >= _npix) {
+            return FLOAT_NAN;
+        }
+        const char* p = _data + (static_cast<int64_t>(map) * _npix + pix) * _bytes;
+        double v;
+        if (_bytes == 4) {
+            uint32_t u;
+            std::memcpy(&u, p, 4);
+            if (_swap) {
+                u = __builtin_bswap32(u);
+            }
+            float f;
+            std::memcpy(&f, &u, 4);
+            v = f;
+        } else {
+            uint64_t u;
+            std::memcpy(&u, p, 8);
+            if (_swap) {
+                u = __builtin_bswap64(u);
+            }
+            double d;
+            std::memcpy(&d, &u, 8);
+            v = d;
+        }
+        float value = static_cast<float>(v * _bscale + _bzero);
+        return IsBadValue(value, _bad) ? FLOAT_NAN : value;
+    }
+
+private:
+    long _npix;
+    long _num_maps;
+    int _bytes;
+    double _bscale, _bzero;
+    float _bad;
+    const char* _base = nullptr;
+    const char* _data = nullptr;
+    size_t _length = 0;
+    bool _swap = true;
+};
+
+// Image-format maps read a whole map at a time through cfitsio (compressed files, integer data), with a small cache
+class CfitsioRowMapSource : public HealpixMapSource {
+public:
+    CfitsioRowMapSource(const std::string& filename, unsigned int hdu, long npix, long num_maps, float bad)
+        : _filename(filename), _hdu(hdu), _npix(npix), _num_maps(num_maps), _bad(bad) {}
+    ~CfitsioRowMapSource() override {
+        if (_fptr) {
+            int status(0);
+            fits_close_file(_fptr, &status);
+        }
+    }
+    size_t NumMaps() const override {
+        return _num_maps;
+    }
+    std::shared_ptr<const std::vector<float>> FullMap(size_t map) override {
+        if (map >= static_cast<size_t>(_num_maps)) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> guard(_mutex);
+        auto found = _cache.find(map);
+        if (found != _cache.end()) {
+            _order.remove(map);
+            _order.push_front(map);
+            return found->second;
+        }
+        if (!_fptr) {
+            int status(0);
+            fits_open_file(&_fptr, _filename.c_str(), READONLY, &status);
+            int hdu_type(0);
+            fits_movabs_hdu(_fptr, _hdu + 1, &hdu_type, &status);
+            if (status) {
+                throw(casacore::AipsError("Cannot open HEALPix image HDU."));
+            }
+        }
+        auto values = std::make_shared<std::vector<float>>(_npix);
+        int status(0), anynul(0);
+        float nulval = FLOAT_NAN;
+        fits_read_img(_fptr, TFLOAT, static_cast<LONGLONG>(map) * _npix + 1, _npix, &nulval, values->data(), &anynul, &status);
+        if (status) {
+            throw(casacore::AipsError("Error reading HEALPix map " + std::to_string(map) + "."));
+        }
+        for (auto& v : *values) {
+            if (IsBadValue(v, _bad)) {
+                v = FLOAT_NAN;
+            }
+        }
+        _cache[map] = values;
+        _order.push_front(map);
+        while (_order.size() > MAX_CACHED_MAPS) {
+            _cache.erase(_order.back());
+            _order.pop_back();
+        }
+        return values;
+    }
+    float Value(size_t map, int64_t pix) override {
+        auto values = FullMap(map);
+        if (!values || pix < 0 || pix >= static_cast<int64_t>(values->size())) {
+            return FLOAT_NAN;
+        }
+        return (*values)[pix];
+    }
+
+private:
+    static constexpr size_t MAX_CACHED_MAPS = 8;
+    std::string _filename;
+    unsigned int _hdu;
+    long _npix;
+    long _num_maps;
+    float _bad;
+    fitsfile* _fptr = nullptr;
+    std::mutex _mutex;
+    std::unordered_map<size_t, std::shared_ptr<std::vector<float>>> _cache;
+    std::list<size_t> _order; // most recently used first
+};
+
+bool IsCompressedFilename(const std::string& filename) {
+    for (const char* suffix : {".gz", ".GZ", ".bz2", ".Z", ".zip", ".fz"}) {
+        size_t n = std::strlen(suffix);
+        if (filename.size() > n && filename.compare(filename.size() - n, n, suffix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+} // namespace carta
 
 // ---------------------------------------------------------------------------
 // HealpixMapInfo
@@ -158,7 +381,7 @@ bool CartaHealpixImage::IsHealpixHdu(const std::string& filename, unsigned int h
 }
 
 bool CartaHealpixImage::IsHealpixFile(const std::string& filename, unsigned int* first_hdu) {
-    // HEALPix maps are binary tables in an extension; check the first few extensions.
+    // HEALPix maps are usually binary tables in an extension, or an image HDU with one map per row; check the first few HDUs.
     fitsfile* fptr(nullptr);
     int status(0);
     fits_open_file(&fptr, filename.c_str(), READONLY, &status);
@@ -169,7 +392,7 @@ bool CartaHealpixImage::IsHealpixFile(const std::string& filename, unsigned int*
     fits_get_num_hdus(fptr, &num_hdus, &status);
     fits_close_file(fptr, &status);
 
-    for (int hdu = 1; hdu < std::min(num_hdus, 4); ++hdu) {
+    for (int hdu = 0; hdu < std::min(num_hdus, 4); ++hdu) {
         if (IsHealpixHdu(filename, hdu)) {
             if (first_hdu) {
                 *first_hdu = hdu;
@@ -191,9 +414,9 @@ bool CartaHealpixImage::ReadMapInfo(const std::string& filename, unsigned int hd
 
     int hdu_type(0);
     fits_movabs_hdu(fptr, hdu + 1, &hdu_type, &status);
-    if (status || hdu_type != BINARY_TBL) {
+    if (status || (hdu_type != BINARY_TBL && hdu_type != IMAGE_HDU)) {
         fits_close_file(fptr, &status);
-        error = "HDU is not a binary table.";
+        error = "HDU is not a binary table or image.";
         return false;
     }
 
@@ -221,6 +444,77 @@ bool CartaHealpixImage::ReadMapInfo(const std::string& filename, unsigned int hd
     }
     if (!ReadDoubleKey(fptr, "BAD_DATA", info.bad_data)) {
         info.bad_data = -1.6375e30;
+    }
+    if (!ReadDoubleKey(fptr, "BMAJ", info.bmaj_deg) || !ReadDoubleKey(fptr, "BMIN", info.bmin_deg)) {
+        info.bmaj_deg = info.bmin_deg = std::nan("");
+    }
+    if (!ReadDoubleKey(fptr, "BPA", info.bpa_deg)) {
+        info.bpa_deg = 0.0;
+    }
+
+    if (hdu_type == IMAGE_HDU) {
+        // One map per row: the first axis is the HEALPix pixel index, the other axes enumerate the maps
+        int naxis(0);
+        long naxes[9] = {0};
+        fits_get_img_dim(fptr, &naxis, &status);
+        if (status || naxis < 1 || naxis > 9) {
+            fits_close_file(fptr, &status);
+            error = "HEALPix image HDU has no axes.";
+            return false;
+        }
+        fits_get_img_size(fptr, naxis, naxes, &status);
+        if (status || naxes[0] != info.npix() || info.explicit_index) {
+            fits_close_file(fptr, &status);
+            error = "HEALPix image HDU is not a full-sky map per row (NAXIS1 must be 12 NSIDE^2).";
+            return false;
+        }
+        info.image_format = true;
+        info.num_maps = 1;
+        for (int i = 1; i < naxis; ++i) {
+            info.num_maps *= naxes[i];
+        }
+
+        // WCS of the map axis: the first CTYPEn (n >= 2) present; files often number it as the cube's third axis
+        info.map_axis_ctype.clear();
+        for (int n = 2; n <= 4 && info.map_axis_ctype.empty(); ++n) {
+            std::string ctype;
+            char key[FLEN_KEYWORD];
+            snprintf(key, sizeof(key), "CTYPE%d", n);
+            if (ReadStringKey(fptr, key, ctype) && !ctype.empty()) {
+                info.map_axis_ctype = ctype;
+                snprintf(key, sizeof(key), "CUNIT%d", n);
+                if (!ReadStringKey(fptr, key, info.map_axis_unit)) {
+                    info.map_axis_unit = "";
+                }
+                snprintf(key, sizeof(key), "CRVAL%d", n);
+                if (!ReadDoubleKey(fptr, key, info.map_axis_crval)) {
+                    info.map_axis_crval = 0.0;
+                }
+                snprintf(key, sizeof(key), "CDELT%d", n);
+                if (!ReadDoubleKey(fptr, key, info.map_axis_cdelt)) {
+                    info.map_axis_cdelt = 1.0;
+                }
+                snprintf(key, sizeof(key), "CRPIX%d", n);
+                if (!ReadDoubleKey(fptr, key, info.map_axis_crpix)) {
+                    info.map_axis_crpix = 1.0;
+                }
+            }
+        }
+        if (!ReadStringKey(fptr, "SPECSYS", info.specsys)) {
+            info.specsys = "";
+        }
+        if (!ReadDoubleKey(fptr, "RESTFRQ", info.rest_freq_hz) && !ReadDoubleKey(fptr, "RESTFREQ", info.rest_freq_hz)) {
+            info.rest_freq_hz = std::nan("");
+        }
+
+        std::string bunit;
+        if (!ReadStringKey(fptr, "BUNIT", bunit)) {
+            bunit = "";
+        }
+        info.columns = {"MAP"};
+        info.column_units = {bunit};
+        fits_close_file(fptr, &status);
+        return true;
     }
 
     // Column names and units
@@ -282,7 +576,7 @@ CartaHealpixImage::CartaHealpixImage(const CartaHealpixImage& other)
       _options(other._options),
       _info(other._info),
       _column_names(other._column_names),
-      _maps(other._maps),
+      _source(other._source),
       _healpix(other._healpix),
       _shape(other._shape),
       _direction_coord(other._direction_coord),
@@ -292,6 +586,11 @@ CartaHealpixImage::CartaHealpixImage(const CartaHealpixImage& other)
       _rotation(other._rotation) {}
 
 void CartaHealpixImage::ReadMap() {
+    if (_info.image_format) {
+        ReadImageFormatMaps();
+        return;
+    }
+
     // Select columns
     std::vector<int> selected;
     if (_options.columns.empty()) {
@@ -357,7 +656,7 @@ void CartaHealpixImage::ReadMap() {
     }
 
     _column_names.clear();
-    _maps.clear();
+    std::vector<std::shared_ptr<std::vector<float>>> maps;
     for (int idx : selected) {
         const std::string& name = _info.columns[idx];
         int colnum(0);
@@ -409,10 +708,56 @@ void CartaHealpixImage::ReadMap() {
         }
 
         _column_names.push_back(name);
-        _maps.push_back(map);
+        maps.push_back(map);
     }
 
     fits_close_file(fptr, &status);
+    _source = std::make_shared<InMemoryMapSource>(std::move(maps));
+}
+
+void CartaHealpixImage::ReadImageFormatMaps() {
+    // Maps are rows of the image HDU; they are read lazily. An uncompressed float file is memory-mapped so that
+    // a cube of hundreds of maps costs no memory of its own; anything else goes through cfitsio with a small cache.
+    _column_names = _info.columns;
+    const float bad = static_cast<float>(_info.bad_data);
+
+    fitsfile* fptr(nullptr);
+    int status(0);
+    fits_open_file(&fptr, _filename.c_str(), READONLY, &status);
+    int hdu_type(0);
+    fits_movabs_hdu(fptr, _hdu + 1, &hdu_type, &status);
+    if (status) {
+        throw(casacore::AipsError("Cannot open HEALPix image HDU."));
+    }
+    int bitpix(0);
+    fits_get_img_type(fptr, &bitpix, &status);
+    double bscale(1.0), bzero(0.0);
+    if (!ReadDoubleKey(fptr, "BSCALE", bscale)) {
+        bscale = 1.0;
+    }
+    if (!ReadDoubleKey(fptr, "BZERO", bzero)) {
+        bzero = 0.0;
+    }
+    LONGLONG headstart(0), datastart(0), dataend(0);
+    ffghadll(fptr, &headstart, &datastart, &dataend, &status); // byte offsets of this HDU within the file
+    int compressed = fits_is_compressed_image(fptr, &status);
+    fits_close_file(fptr, &status);
+
+    bool can_map = (status == 0) && !compressed && !IsCompressedFilename(_filename) && (bitpix == FLOAT_IMG || bitpix == DOUBLE_IMG);
+    if (can_map) {
+        try {
+            _source =
+                std::make_shared<MappedImageMapSource>(_filename, datastart, bitpix, _info.npix(), _info.num_maps, bscale, bzero, bad);
+            return;
+        } catch (const casacore::AipsError& err) {
+            spdlog::debug("HEALPix image {}: {} Falling back to cfitsio reads.", _filename, err.getMesg());
+        }
+    }
+    _source = std::make_shared<CfitsioRowMapSource>(_filename, _hdu, _info.npix(), _info.num_maps, bad);
+}
+
+size_t CartaHealpixImage::NumMaps() const {
+    return _source ? _source->NumMaps() : 0;
 }
 
 void CartaHealpixImage::SetUpCoordinateSystem() {
@@ -456,6 +801,19 @@ void CartaHealpixImage::SetUpCoordinateSystem() {
             pixel_order(1) = 0;
             matched.transpose(world_order, pixel_order);
         }
+        if ((_options.width > 0 && _options.width != width) || (_options.height > 0 && _options.height != height)) {
+            // A different grid size keeps the image's WCS and centres its grid in ours, so overlays still align
+            int new_width = _options.width > 0 ? _options.width : width;
+            int new_height = _options.height > 0 ? _options.height : height;
+            casacore::DirectionCoordinate dir = matched.directionCoordinate();
+            casacore::Vector<casacore::Double> refpix = dir.referencePixel();
+            refpix(0) += (new_width - width) / 2.0;
+            refpix(1) += (new_height - height) / 2.0;
+            dir.setReferencePixel(refpix);
+            matched.replaceCoordinate(dir, matched.directionCoordinateNumber());
+            width = new_width;
+            height = new_height;
+        }
         coord_sys = matched;
         _direction_coord = matched.directionCoordinate();
         _grid_frame = _direction_coord.directionType();
@@ -489,9 +847,17 @@ void CartaHealpixImage::SetUpCoordinateSystem() {
         coord_sys.addCoordinate(_direction_coord);
     }
 
-    // Column axis
-    const size_t ncol = _maps.size();
-    if (ncol > 1) {
+    // Third axis: the maps
+    const size_t ncol = NumMaps();
+    if (_info.image_format && ncol > 1) {
+        if (!AddMapAxisCoordinate(coord_sys)) {
+            casacore::Vector<casacore::String> names(1, "MAP"), units(1, "");
+            casacore::Vector<casacore::Double> refval(1, 0.0), inc(1, 1.0), refpix(1, 0.0);
+            casacore::Matrix<casacore::Double> pc(1, 1, 1.0);
+            coord_sys.addCoordinate(casacore::LinearCoordinate(names, units, refval, inc, pc, refpix));
+        }
+        _shape = casacore::IPosition(3, width, height, ncol);
+    } else if (ncol > 1) {
         casacore::Vector<casacore::Int> stokes(ncol);
         bool all_stokes(true);
         for (size_t i = 0; i < ncol; ++i) {
@@ -529,6 +895,52 @@ void CartaHealpixImage::SetUpCoordinateSystem() {
             setUnits(casacore::Unit(unit));
         }
     }
+
+    // Restoring beam from BMAJ/BMIN/BPA (degrees)
+    if (std::isfinite(_info.bmaj_deg) && std::isfinite(_info.bmin_deg) && _info.bmaj_deg > 0 && _info.bmin_deg > 0) {
+        casacore::ImageInfo info = imageInfo();
+        info.setRestoringBeam(casacore::GaussianBeam(casacore::Quantity(_info.bmaj_deg, "deg"), casacore::Quantity(_info.bmin_deg, "deg"),
+            casacore::Quantity(std::isfinite(_info.bpa_deg) ? _info.bpa_deg : 0.0, "deg")));
+        setImageInfo(info);
+    }
+}
+
+bool CartaHealpixImage::AddMapAxisCoordinate(casacore::CoordinateSystem& coord_sys) {
+    // Spectral axis for FREQ-like map axes, a linear axis for any other named axis
+    if (!_info.has_map_axis()) {
+        return false;
+    }
+    std::string ctype = UpperTrim(_info.map_axis_ctype);
+    std::string base = ctype.substr(0, ctype.find('-'));
+    casacore::UnitMap::addFITS();
+    const double refpix = _info.map_axis_crpix - 1.0; // 0-based
+
+    if (base == "FREQ") {
+        double factor(1.0);
+        if (!_info.map_axis_unit.empty() && casacore::UnitVal::check(_info.map_axis_unit)) {
+            factor = casacore::Quantity(1.0, _info.map_axis_unit).getValue("Hz");
+        }
+        casacore::MFrequency::Types freq_type(casacore::MFrequency::TOPO);
+        if (!_info.specsys.empty()) {
+            casacore::MFrequency::Types parsed;
+            if (casacore::MFrequency::getType(parsed, _info.specsys)) {
+                freq_type = parsed;
+            }
+        }
+        double rest_freq = std::isfinite(_info.rest_freq_hz) ? _info.rest_freq_hz : 0.0;
+        coord_sys.addCoordinate(
+            casacore::SpectralCoordinate(freq_type, _info.map_axis_crval * factor, _info.map_axis_cdelt * factor, refpix, rest_freq));
+        return true;
+    }
+
+    casacore::Vector<casacore::String> names(1, base.empty() ? "MAP" : base), units(1, "");
+    if (!_info.map_axis_unit.empty() && casacore::UnitVal::check(_info.map_axis_unit)) {
+        units(0) = _info.map_axis_unit;
+    }
+    casacore::Vector<casacore::Double> refval(1, _info.map_axis_crval), inc(1, _info.map_axis_cdelt), refpix_v(1, refpix);
+    casacore::Matrix<casacore::Double> pc(1, 1, 1.0);
+    coord_sys.addCoordinate(casacore::LinearCoordinate(names, units, refval, inc, pc, refpix_v));
+    return true;
 }
 
 void CartaHealpixImage::SetUpFrameRotation() {
@@ -590,7 +1002,7 @@ casacore::IPosition CartaHealpixImage::shape() const {
 }
 
 casacore::Bool CartaHealpixImage::ok() const {
-    return !_maps.empty();
+    return _source && _source->NumMaps() > 0;
 }
 
 casacore::ImageInterface<float>* CartaHealpixImage::cloneII() const {
@@ -756,11 +1168,20 @@ casacore::Bool CartaHealpixImage::doGetSlice(casacore::Array<float>& buffer, con
 
 void CartaHealpixImage::Lookup(
     const double* lon, const double* lat, const std::vector<bool>& valid, size_t npoints, size_t column, float* out) const {
-    if (column >= _maps.size()) {
+    if (!_source || column >= _source->NumMaps()) {
         std::fill(out, out + npoints, FLOAT_NAN);
         return;
     }
-    const std::vector<float>& map = *_maps[column];
+    // A whole map in memory when the source has one; otherwise single-pixel reads from the source
+    std::shared_ptr<const std::vector<float>> held = _source->FullMap(column);
+    const float* map = held ? held->data() : nullptr;
+    const int64_t npix = _info.npix();
+    auto value_at = [&](int64_t pix) -> float {
+        if (map) {
+            return (pix >= 0 && pix < npix) ? map[pix] : FLOAT_NAN;
+        }
+        return _source->Value(column, pix);
+    };
 
     for (size_t p = 0; p < npoints; ++p) {
         if (!valid[p]) {
@@ -780,7 +1201,7 @@ void CartaHealpixImage::Lookup(
             _healpix->get_interpol(ptg, pix, wgt);
             double sum(0.0), wsum(0.0);
             for (int n = 0; n < 4; ++n) {
-                float v = map[pix[n]];
+                float v = value_at(pix[n]);
                 if (std::isfinite(v)) {
                     sum += wgt[n] * v;
                     wsum += wgt[n];
@@ -788,7 +1209,7 @@ void CartaHealpixImage::Lookup(
             }
             out[p] = wsum > 0.0 ? static_cast<float>(sum / wsum) : FLOAT_NAN;
         } else {
-            out[p] = map[_healpix->ang2pix(ptg)];
+            out[p] = value_at(_healpix->ang2pix(ptg));
         }
     }
 }

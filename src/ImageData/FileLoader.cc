@@ -33,6 +33,9 @@ std::shared_ptr<FileLoader> FileLoader::GetLoader(const std::string& filename, c
         // filename is LEL expression for image(s) in directory
         return std::make_shared<ExprLoader>(filename, directory);
     } else if (IsCompressedFits(filename)) {
+        if (CartaHealpixImage::IsHealpixFile(filename)) {
+            return std::make_shared<HealpixLoader>(filename); // cfitsio reads the gzipped maps
+        }
         return std::make_shared<FitsLoader>(filename, true);
     } else if (IsRemoteHttpFile(filename)) {
         return std::make_shared<FitsLoader>(filename, false, true);

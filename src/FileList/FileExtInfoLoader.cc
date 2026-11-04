@@ -704,6 +704,15 @@ void FileExtInfoLoader::AddHealpixEntries(CARTA::FileInfoExtended& extended_info
         }
     }
     Message::AddComputedEntry(extended_info, "HEALPix columns", columns);
+    if (info.image_format) {
+        std::string maps = std::to_string(info.num_maps);
+        if (info.has_map_axis()) {
+            double first = info.map_axis_crval + (1 - info.map_axis_crpix) * info.map_axis_cdelt;
+            double last = info.map_axis_crval + (info.num_maps - info.map_axis_crpix) * info.map_axis_cdelt;
+            maps += fmt::format(" ({} {:.6g} to {:.6g} {})", info.map_axis_ctype, first, last, info.map_axis_unit);
+        }
+        Message::AddComputedEntry(extended_info, "HEALPix maps", maps);
+    }
 
     std::string reprojection;
     if (options.match_coord_sys) {

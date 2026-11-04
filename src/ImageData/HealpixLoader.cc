@@ -63,9 +63,10 @@ void HealpixLoader::AllocateImage(const std::string& hdu) {
 
         auto healpix_image = dynamic_cast<CartaHealpixImage*>(_image.get());
         const auto& info = healpix_image->MapInfo();
-        spdlog::info("HEALPix map {}: NSIDE={} {} {} ({} column{}), grid {}x{} in {:.1f} ms", _filename, info.nside,
-            info.nested ? "NESTED" : "RING", info.coordsys.empty() ? "?" : info.coordsys, healpix_image->ColumnNames().size(),
-            healpix_image->ColumnNames().size() == 1 ? "" : "s", _image_shape(0), _image_shape(1), t.Elapsed().ms());
+        spdlog::info("HEALPix map {}: NSIDE={} {} {} ({} {}{}), grid {}x{} in {:.1f} ms", _filename, info.nside,
+            info.nested ? "NESTED" : "RING", info.coordsys.empty() ? "?" : info.coordsys, healpix_image->NumMaps(),
+            info.image_format ? "map" : "column", healpix_image->NumMaps() == 1 ? "" : "s", _image_shape(0), _image_shape(1),
+            t.Elapsed().ms());
     }
 }
 

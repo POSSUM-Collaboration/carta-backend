@@ -66,6 +66,15 @@ void FitsHduList::CheckFitsHeaders(fitsfile* fptr, std::vector<std::string>& hdu
 
         bool is_image(false), is_fz(false), is_healpix(false);
 
+        // A HEALPix map is a binary table, or an image HDU holding one map per row; both carry PIXTYPE
+        auto has_healpix_pixtype = [&]() {
+            status = 0;
+            key = "PIXTYPE";
+            char pixtype[FLEN_VALUE];
+            fits_read_key(fptr, TSTRING, key.c_str(), pixtype, comment, &status);
+            return (status == 0) && (std::string(pixtype).rfind("HEALPIX", 0) == 0);
+        };
+
         if (hdu == 0) {
             // Check SIMPLE for primary header only; exit if false
             status = 0;
@@ -77,13 +86,16 @@ void FitsHduList::CheckFitsHeaders(fitsfile* fptr, std::vector<std::string>& hdu
                 error = "FITS error: SIMPLE missing or false.";
                 break;
             }
+            is_healpix = has_healpix_pixtype();
         } else {
             int hdutype(-1);
             status = 0;
             fits_get_hdu_type(fptr, &hdutype, &status);
             is_image = (hdutype == IMAGE_HDU);
 
-            if (!is_image) {
+            if (is_image) {
+                is_healpix = has_healpix_pixtype();
+            } else {
                 // Check ZIMAGE for fz compressed image
                 status = 0;
                 key = "ZIMAGE";
@@ -92,18 +104,13 @@ void FitsHduList::CheckFitsHeaders(fitsfile* fptr, std::vector<std::string>& hdu
                 if (is_fz) {
                     is_image = true;
                 } else if (hdutype == BINARY_TBL) {
-                    // Check PIXTYPE for a HEALPix map (binary table extension)
-                    status = 0;
-                    key = "PIXTYPE";
-                    char pixtype[FLEN_VALUE];
-                    fits_read_key(fptr, TSTRING, key.c_str(), pixtype, comment, &status);
-                    is_healpix = (status == 0) && (std::string(pixtype).rfind("HEALPIX", 0) == 0);
+                    is_healpix = has_healpix_pixtype();
                 }
             }
         }
 
         if (is_healpix) {
-            // Add HEALPix extension with NSIDE and ordering as its name
+            // Add HEALPix HDU with NSIDE and ordering as its name
             long nside(0);
             status = 0;
             key = "NSIDE";

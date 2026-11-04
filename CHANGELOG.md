@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 * Added support for HEALPix maps (FITS binary tables with PIXTYPE='HEALPIX'): maps are reprojected on the fly onto a regular grid (default all-sky Mollweide at the HEALPix resolution; any WCS projection, frame, centre and pixel scale; or the grid of another open image), with I/Q/U/V columns exposed as a Stokes axis. Requires the healpix_cxx library.
+* Added support for HEALPix maps stored as image HDUs (PIXTYPE = HEALPIX with one full-sky map per row, e.g. GMIMS cubes): the rows become a spectral (or linear) axis, the file is memory-mapped and read lazily, and BMAJ/BMIN/BPA and BUNIT are honoured. Matching a map to an image accepts a larger grid size centred on the image.
 
 ### Fixed
 * Fixed incorrect scientic notation parsing ([#1632](https://github.com/CARTAvis/carta-backend/issues/1632)). 

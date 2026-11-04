@@ -113,6 +113,49 @@ std::vector<HealpixColumn> LonLatColumns(long nside, bool nested) {
     return {lon, lat};
 }
 
+// Write an image-format HEALPix cube: primary HDU [npix, nmaps] (one full-sky map per row), map k = LON + 1000 k,
+// with a FREQ WCS on the map axis numbered as a cube's third axis (as GMIMS does), a beam and a unit
+void WriteHealpixImageCube(const fs::path& path, long nside, int nmaps) {
+    fitsfile* fptr(nullptr);
+    int status(0);
+    fs::remove(path);
+    fits_create_file(&fptr, path.string().c_str(), &status);
+    long npix = 12 * nside * nside;
+    long naxes[2] = {npix, nmaps};
+    fits_create_img(fptr, FLOAT_IMG, 2, naxes, &status);
+    char pixtype[] = "HEALPIX", ordering[] = "RING", coordsys[] = "C", indxschm[] = "IMPLICIT", object[] = "FULLSKY";
+    char ctype3[] = "FREQ", cunit3[] = "Hz", bunit[] = "K";
+    fits_write_key(fptr, TSTRING, "PIXTYPE", pixtype, nullptr, &status);
+    fits_write_key(fptr, TSTRING, "ORDERING", ordering, nullptr, &status);
+    fits_write_key(fptr, TLONG, "NSIDE", &nside, nullptr, &status);
+    fits_write_key(fptr, TSTRING, "COORDSYS", coordsys, nullptr, &status);
+    fits_write_key(fptr, TSTRING, "INDXSCHM", indxschm, nullptr, &status);
+    fits_write_key(fptr, TSTRING, "OBJECT", object, nullptr, &status);
+    double crval3(286.25e6), cdelt3(0.5e6), crpix3(1.0), bmaj(1.35), bmin(1.2), bpa(10.0), restfreq(300.0e6);
+    fits_write_key(fptr, TSTRING, "CTYPE3", ctype3, nullptr, &status);
+    fits_write_key(fptr, TDOUBLE, "CRVAL3", &crval3, nullptr, &status);
+    fits_write_key(fptr, TDOUBLE, "CDELT3", &cdelt3, nullptr, &status);
+    fits_write_key(fptr, TDOUBLE, "CRPIX3", &crpix3, nullptr, &status);
+    fits_write_key(fptr, TSTRING, "CUNIT3", cunit3, nullptr, &status);
+    fits_write_key(fptr, TDOUBLE, "BMAJ", &bmaj, nullptr, &status);
+    fits_write_key(fptr, TDOUBLE, "BMIN", &bmin, nullptr, &status);
+    fits_write_key(fptr, TDOUBLE, "BPA", &bpa, nullptr, &status);
+    fits_write_key(fptr, TDOUBLE, "RESTFREQ", &restfreq, nullptr, &status);
+    fits_write_key(fptr, TSTRING, "BUNIT", bunit, nullptr, &status);
+
+    auto lon = LonLatColumns(nside, false)[0].values;
+    std::vector<float> values(npix * nmaps);
+    for (int k = 0; k < nmaps; ++k) {
+        for (long pix = 0; pix < npix; ++pix) {
+            values[k * npix + pix] = lon[pix] + 1000.0f * k;
+        }
+    }
+    values[2] = -1.6375e30f; // an UNSEEN pixel in map 0
+    fits_write_img(fptr, TFLOAT, 1, npix * nmaps, values.data(), &status);
+    fits_close_file(fptr, &status);
+    ASSERT_EQ(status, 0) << "writing " << path;
+}
+
 double LonDiff(double a, double b) {
     double d = std::fmod(std::abs(a - b), 360.0);
     return std::min(d, 360.0 - d);
@@ -156,6 +199,10 @@ public:
             }
         }
         WriteHealpixFile(GeneratedPath("partial_ring_c.fits"), 32, false, "C", {{"SIGNAL", "", values}}, &pixels);
+
+        // Image-format cubes: plain (memory-mapped) and gzip-compressed (read through cfitsio)
+        WriteHealpixImageCube(GeneratedPath("cube_image_format.fits"), 16, 3);
+        WriteHealpixImageCube(GeneratedPath("cube_image_format.fits.gz"), 16, 3);
     }
 };
 
@@ -513,6 +560,143 @@ TEST_F(HealpixTest, LargeSectionIsReadInChunksConsistently) {
             if (std::isfinite(a) || std::isfinite(b)) {
                 ASSERT_FLOAT_EQ(a, b) << "strided pixel " << x << "," << y;
             }
+        }
+    }
+}
+
+TEST_F(HealpixTest, ImageFormatCubeOpensAsSpectralCube) {
+    for (const std::string name : {"cube_image_format.fits", "cube_image_format.fits.gz"}) {
+        auto path = GeneratedPath(name).string();
+        unsigned int first_hdu(99);
+        ASSERT_TRUE(CartaHealpixImage::IsHealpixFile(path, &first_hdu)) << name;
+        EXPECT_EQ(first_hdu, 0);
+
+        HealpixMapInfo info;
+        std::string error;
+        ASSERT_TRUE(CartaHealpixImage::ReadMapInfo(path, 0, info, error)) << error;
+        EXPECT_TRUE(info.image_format);
+        EXPECT_EQ(info.num_maps, 3);
+        EXPECT_EQ(info.nside, 16);
+        EXPECT_EQ(info.map_axis_ctype, "FREQ");
+        EXPECT_TRUE(info.has_map_axis());
+        EXPECT_DOUBLE_EQ(info.map_axis_crval, 286.25e6);
+        EXPECT_EQ(info.columns, std::vector<std::string>({"MAP"}));
+        EXPECT_EQ(info.column_units, std::vector<std::string>({"K"}));
+
+        if (name == "cube_image_format.fits") { // gzipped files take the CompressedFits header path instead
+            std::vector<std::string> hdu_list;
+            FitsHduList fits_hdu_list(path);
+            fits_hdu_list.GetHduList(hdu_list, error);
+            ASSERT_EQ(hdu_list.size(), 1) << error;
+            EXPECT_EQ(hdu_list[0], "0: HEALPix NSIDE=16 RING");
+        }
+
+        auto loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+        ASSERT_TRUE(loader) << name;
+        HealpixProjectionOptions options;
+        options.pixel_scale_deg = 2.0;
+        loader->SetProjectionOptions(options);
+        loader->OpenFile("");
+        auto image = loader->GetImage();
+        ASSERT_TRUE(image);
+        auto shape = image->shape();
+        ASSERT_EQ(shape.size(), 3) << name;
+        EXPECT_EQ(shape(0), 180);
+        EXPECT_EQ(shape(1), 90);
+        EXPECT_EQ(shape(2), 3);
+        EXPECT_EQ(image->units().getName(), "K");
+        EXPECT_FALSE(image->imageInfo().restoringBeam().isNull());
+        EXPECT_NEAR(image->imageInfo().restoringBeam().getMajor("deg"), 1.35, 1e-9);
+
+        const auto& coord_sys = image->coordinates();
+        ASSERT_TRUE(coord_sys.hasSpectralAxis());
+        EXPECT_EQ(coord_sys.spectralAxisNumber(), 2);
+        double freq(0.0);
+        ASSERT_TRUE(coord_sys.spectralCoordinate().toWorld(freq, 2.0));
+        EXPECT_NEAR(freq, 287.25e6, 1.0);
+        EXPECT_NEAR(coord_sys.spectralCoordinate().restFrequency(), 300.0e6, 1.0);
+
+        // Map k holds LON + 1000 k: read channel 2 and compare with the grid's own longitudes
+        casacore::Array<float> data;
+        casacore::IPosition start(3, 0, 0, 2), end(3, 179, 89, 2);
+        image->doGetSlice(data, casacore::Slicer(start, end, casacore::Slicer::endIsLast));
+        const auto& dir = coord_sys.directionCoordinate();
+        const double resolution = 3.66; // deg at NSIDE=16
+        int checked(0);
+        for (int y = 5; y < 90; y += 10) {
+            for (int x = 5; x < 180; x += 15) {
+                casacore::Vector<double> pixel(2), world(2);
+                pixel(0) = x;
+                pixel(1) = y;
+                if (!dir.toWorld(world, pixel)) {
+                    continue;
+                }
+                float value = data(casacore::IPosition(3, x, y, 0));
+                ASSERT_TRUE(std::isfinite(value)) << name << " pixel " << x << "," << y;
+                // longitude difference scaled to an angle on the sky (pixels are wide in longitude near the poles)
+                double lon_error = LonDiff(value - 2000.0f, world(0) * DEG) * std::cos(world(1));
+                EXPECT_LT(lon_error, 2.0 * resolution) << name << " pixel " << x << "," << y;
+                ++checked;
+            }
+        }
+        EXPECT_GT(checked, 50);
+
+        // A spectrum through one position reads every map; map 0 has an UNSEEN pixel that becomes NaN
+        casacore::Array<float> spectrum;
+        casacore::IPosition spec_start(3, 90, 45, 0), spec_end(3, 90, 45, 2);
+        image->doGetSlice(spectrum, casacore::Slicer(spec_start, spec_end, casacore::Slicer::endIsLast));
+        ASSERT_EQ(spectrum.shape(), casacore::IPosition(3, 1, 1, 3));
+        float v0 = spectrum(casacore::IPosition(3, 0, 0, 0)), v1 = spectrum(casacore::IPosition(3, 0, 0, 1)),
+              v2 = spectrum(casacore::IPosition(3, 0, 0, 2));
+        EXPECT_NEAR(v1 - v0, 1000.0f, 1e-3);
+        EXPECT_NEAR(v2 - v1, 1000.0f, 1e-3);
+
+        // Frame treats it as a spectral cube
+        std::unique_ptr<Frame> frame(new Frame(0, loader, "0"));
+        ASSERT_TRUE(frame->IsValid()) << frame->GetErrorMessage();
+        EXPECT_EQ(frame->Depth(), 3);
+        EXPECT_EQ(frame->Width(), 180);
+    }
+}
+
+TEST_F(HealpixTest, MatchedGridCanBeEnlargedAroundTheImage) {
+    auto path = GeneratedPath("lonlat_ring_c.fits").string();
+    auto loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+    ASSERT_TRUE(loader);
+
+    casacore::Matrix<double> xform(2, 2, 0.0);
+    xform.diagonal() = 1.0;
+    casacore::DirectionCoordinate target_dir(casacore::MDirection::J2000, casacore::Projection(casacore::Projection::TAN), 80.0 / DEG,
+        -40.0 / DEG, -0.25 / DEG, 0.25 / DEG, xform, 30.0, 20.0);
+    auto match = std::make_shared<casacore::CoordinateSystem>();
+    match->addCoordinate(target_dir);
+
+    HealpixProjectionOptions options;
+    options.match_coord_sys = match;
+    options.match_shape = casacore::IPosition(2, 60, 40);
+    options.width = 100; // 20 more pixels on each side
+    options.height = 60; // 10 more on each side
+    options.columns = {"LON"};
+    loader->SetProjectionOptions(options);
+    loader->OpenFile("1");
+    auto image = loader->GetImage();
+    ASSERT_TRUE(image);
+    EXPECT_EQ(image->shape(), casacore::IPosition(2, 100, 60));
+
+    // Pixel (x + 20, y + 10) of the enlarged grid is pixel (x, y) of the image
+    const auto& dir = image->coordinates().directionCoordinate();
+    EXPECT_EQ(dir.projection().name(), "TAN");
+    for (int y = 0; y < 40; y += 13) {
+        for (int x = 0; x < 60; x += 17) {
+            casacore::Vector<double> pixel(2), world(2), target_world(2);
+            pixel(0) = x + 20;
+            pixel(1) = y + 10;
+            ASSERT_TRUE(dir.toWorld(world, pixel));
+            pixel(0) = x;
+            pixel(1) = y;
+            ASSERT_TRUE(target_dir.toWorld(target_world, pixel));
+            EXPECT_NEAR(world(0), target_world(0), 1e-12) << x << "," << y;
+            EXPECT_NEAR(world(1), target_world(1), 1e-12) << x << "," << y;
         }
     }
 }
