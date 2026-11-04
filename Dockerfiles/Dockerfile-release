@@ -18,7 +18,8 @@ RUN apt-get update && \
     apt-get update && \
     apt-get install -y --no-install-recommends $(cat /tmp/runtime-packages.txt) && \
     (apt-get install -y --no-install-recommends casacore-data || true) && \
-    rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
+    rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt && \
+    echo /opt/carta-casacore/lib > /etc/ld.so.conf.d/carta-casacore.conf && ldconfig
 
 COPY carta/ /usr/local/
 
