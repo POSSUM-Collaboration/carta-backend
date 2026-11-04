@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <casacore/casa/Arrays/Matrix.h>
@@ -72,15 +73,16 @@ struct HealpixMapInfo {
  * open image) overrides the projection fields entirely.
  */
 struct HealpixProjectionOptions {
-    std::string projection = "MOL";                              ///< WCS projection code (MOL, AIT, CAR, SFL, ZEA, TAN, SIN, HPX, ...)
-    std::string frame;                                           ///< target celestial frame: G, C (ICRS/J2000), E; empty = map frame
-    double center_lon_deg = std::nan("");                        ///< reference longitude; NaN = 0
-    double center_lat_deg = std::nan("");                        ///< reference latitude; NaN = 0 (all-sky) or map centre
-    double pixel_scale_deg = std::nan("");                       ///< NaN = HEALPix resolution
-    int width = 0;                                               ///< 0 = enough to cover the sky (or the matched image's size)
-    int height = 0;                                              ///< when matching, a size other than the image's keeps its grid centred
-    bool bilinear = false;                                       ///< bilinear interpolation across the 4 nearest HEALPix pixels
-    std::vector<std::string> columns;                            ///< empty = all data columns
+    std::string projection = "MOL";        ///< WCS projection code (MOL, AIT, CAR, SFL, ZEA, TAN, SIN, HPX, ...)
+    std::string frame;                     ///< target celestial frame: G, C (ICRS/J2000), E; empty = map frame
+    double center_lon_deg = std::nan("");  ///< reference longitude; NaN = 0
+    double center_lat_deg = std::nan("");  ///< reference latitude; NaN = 0 (all-sky) or map centre
+    double pixel_scale_deg = std::nan(""); ///< NaN = HEALPix resolution
+    int width = 0;                         ///< 0 = enough to cover the sky (or the matched image's size)
+    int height = 0;                        ///< when matching, a size other than the image's keeps its grid centred
+    bool extend_sky = false;               ///< when matching: enlarge the grid (centred) to show the map around the image
+    bool bilinear = false;                 ///< bilinear interpolation across the 4 nearest HEALPix pixels
+    std::vector<std::string> columns;      ///< empty = all data columns
     std::shared_ptr<casacore::CoordinateSystem> match_coord_sys; ///< reproject onto this system's direction coordinate
     casacore::IPosition match_shape;                             ///< and this pixel grid (render axes)
 };
@@ -133,12 +135,26 @@ public:
     }
     /// Number of maps along the third axis (table columns selected, or image-format maps)
     size_t NumMaps() const;
+    /// HEALPix pixels per map
+    size_t Npix() const;
+    /// A whole map's values when the source holds one in memory (NaN where unseen), else null
+    std::shared_ptr<const std::vector<float>> MapValues(size_t map) const;
+    /// One HEALPix pixel of a map (NaN where unseen or out of range)
+    float MapValue(size_t map, int64_t pix) const;
+    /**
+     * @brief Map values at a regular set of grid positions: x0 + i dx (i < nx), y0 + j dy (j < ny) in 0-based grid
+     * pixels (fractional positions allowed, e.g. block centres for a downsampled tile), for the maps
+     * column0 + c column_stride (c < ncol). Output is x fastest, then y, then map. Thread-safe.
+     */
+    void Sample(double x0, double dx, size_t nx, double y0, double dy, size_t ny, size_t column0, size_t column_stride, size_t ncol,
+        float* data) const;
 
 private:
     void ReadMap();
     void ReadImageFormatMaps();
     void SetUpCoordinateSystem();
     bool AddMapAxisCoordinate(casacore::CoordinateSystem& coord_sys);
+    static std::pair<int, int> ExtendedGridSize(const casacore::DirectionCoordinate& direction, int width, int height);
     void SetUpFrameRotation();
     void Lookup(const double* lon, const double* lat, const std::vector<bool>& valid, size_t npoints, size_t column, float* out) const;
 

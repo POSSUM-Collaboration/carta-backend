@@ -700,3 +700,107 @@ TEST_F(HealpixTest, MatchedGridCanBeEnlargedAroundTheImage) {
         }
     }
 }
+
+TEST_F(HealpixTest, ExtendedMatchShowsTheMapAroundTheImage) {
+    // A small SIN image at 0.25 deg/pixel: extended, the grid reaches the hemisphere edge (1 rad = 229 pixels each way)
+    auto path = GeneratedPath("lonlat_ring_c.fits").string();
+    auto loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+    ASSERT_TRUE(loader);
+
+    casacore::Matrix<double> xform(2, 2, 0.0);
+    xform.diagonal() = 1.0;
+    casacore::DirectionCoordinate target_dir(casacore::MDirection::J2000, casacore::Projection(casacore::Projection::SIN), 80.0 / DEG,
+        -40.0 / DEG, -0.25 / DEG, 0.25 / DEG, xform, 30.0, 20.0);
+    auto match = std::make_shared<casacore::CoordinateSystem>();
+    match->addCoordinate(target_dir);
+
+    HealpixProjectionOptions options;
+    options.match_coord_sys = match;
+    options.match_shape = casacore::IPosition(2, 60, 40);
+    options.extend_sky = true;
+    options.columns = {"LON"};
+    loader->SetProjectionOptions(options);
+    loader->OpenFile("1");
+    auto image = loader->GetImage();
+    ASSERT_TRUE(image);
+    auto shape = image->shape();
+    // 229 pixels of reach each side of the centre plus the centre itself, then rounded to keep the image on integer pixels
+    EXPECT_GE(shape(0), 2 * 229 - 2);
+    EXPECT_LE(shape(0), 2 * 229 + 2);
+    EXPECT_GE(shape(1), 2 * 229 - 2);
+    EXPECT_LE(shape(1), 2 * 229 + 2);
+    EXPECT_EQ((shape(0) - 60) % 2, 0);
+    EXPECT_EQ((shape(1) - 40) % 2, 0);
+
+    // The image's own pixels sit in the middle with the same world coordinates
+    const auto& dir = image->coordinates().directionCoordinate();
+    const int dx = (shape(0) - 60) / 2, dy = (shape(1) - 40) / 2;
+    casacore::Vector<double> pixel(2), world(2), target_world(2);
+    pixel(0) = 30 + dx;
+    pixel(1) = 20 + dy;
+    ASSERT_TRUE(dir.toWorld(world, pixel));
+    pixel(0) = 30;
+    pixel(1) = 20;
+    ASSERT_TRUE(target_dir.toWorld(target_world, pixel));
+    EXPECT_NEAR(world(0), target_world(0), 1e-12);
+    EXPECT_NEAR(world(1), target_world(1), 1e-12);
+
+    // Tiles come from the loader at every level without a full-plane cache: the frame opens, a mip-4 tile samples
+    // block centres, and a full-resolution chunk matches a direct read
+    EXPECT_TRUE(loader->UseTileCache());
+    EXPECT_TRUE(loader->HasMip(2));
+    EXPECT_TRUE(loader->HasMip(8));
+    std::unique_ptr<Frame> frame(new Frame(0, loader, "1"));
+    ASSERT_TRUE(frame->IsValid()) << frame->GetErrorMessage();
+    EXPECT_EQ(frame->Width(), shape(0));
+
+    // A 64x64 region around the image (the grid's corners are off the hemisphere), on a 4-pixel boundary and inside chunk 0
+    std::mutex mutex;
+    const int x0 = std::min(448, ((static_cast<int>(shape(0)) / 2 - 32) / 4) * 4),
+              y0 = std::min(448, ((static_cast<int>(shape(1)) / 2 - 32) / 4) * 4);
+    CARTA::ImageBounds bounds;
+    bounds.set_x_min(x0);
+    bounds.set_x_max(x0 + 64);
+    bounds.set_y_min(y0);
+    bounds.set_y_max(y0 + 64);
+    std::vector<float> mip_data;
+    ASSERT_TRUE(loader->GetDownsampledRasterData(mip_data, 0, 0, bounds, 4, mutex));
+    ASSERT_EQ(mip_data.size(), 16 * 16);
+    std::vector<float> full_data;
+    int chunk_width(0), chunk_height(0);
+    ASSERT_TRUE(loader->GetChunk(full_data, chunk_width, chunk_height, 0, 0, 0, 0, mutex));
+    EXPECT_EQ(chunk_width, std::min(512, static_cast<int>(shape(0))));
+    EXPECT_EQ(chunk_height, std::min(512, static_cast<int>(shape(1))));
+    casacore::Array<float> direct;
+    casacore::IPosition start(2, x0, y0), end(2, x0 + 63, y0 + 63);
+    image->doGetSlice(direct, casacore::Slicer(start, end, casacore::Slicer::endIsLast));
+    int compared(0);
+    for (int j = 0; j < 16; ++j) {
+        for (int i = 0; i < 16; ++i) {
+            // block centre of a 4x4 block = full-resolution pixel (4i + 1.5, 4j + 1.5): between pixels, so compare with its neighbours
+            float m = mip_data[j * 16 + i];
+            float a = direct(casacore::IPosition(2, 4 * i + 1, 4 * j + 1)), b = direct(casacore::IPosition(2, 4 * i + 2, 4 * j + 2));
+            float c = full_data[(y0 + 4 * j + 1) * chunk_width + x0 + 4 * i + 1];
+            if (std::isfinite(m) && std::isfinite(a) && std::isfinite(b)) {
+                EXPECT_LE(LonDiff(m, a), 2.0 * 1.8323 + 1e-3) << i << "," << j;
+                EXPECT_FLOAT_EQ(a, c);
+                ++compared;
+            }
+        }
+    }
+    EXPECT_GT(compared, 100);
+
+    // Statistics describe the map itself: LON spans 0..360 over all 12288 pixels
+    auto& stats = loader->GetImageStats(0, 0);
+    ASSERT_TRUE(stats.valid);
+    EXPECT_EQ(stats.basic_stats[CARTA::StatsType::NumPixels], 12 * 32 * 32);
+    EXPECT_NEAR(stats.basic_stats[CARTA::StatsType::Min], 0.0, 2.0);
+    EXPECT_NEAR(stats.basic_stats[CARTA::StatsType::Max], 360.0, 2.0);
+    EXPECT_NEAR(stats.basic_stats[CARTA::StatsType::Mean], 180.0, 1.0);
+    EXPECT_GT(stats.histogram_bins.size(), 10);
+    long total(0);
+    for (auto n : stats.histogram_bins) {
+        total += n;
+    }
+    EXPECT_EQ(total, 12 * 32 * 32);
+}

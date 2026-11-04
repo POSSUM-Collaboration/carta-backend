@@ -429,6 +429,12 @@ bool Frame::FillImageCache() {
     if (_image_cache == nullptr) {
         // allocate memory for full image cache
         _image_cache_size = _dims.width * _dims.height;
+        if (_use_tile_cache && _loader->HasMip(2) && (_image_cache_size > MAX_IMAGE_CACHE_PIXELS)) {
+            // A grid served tile by tile (e.g. a HEALPix map extended around a matched image) may be far too large to hold
+            spdlog::error("Session {}: image plane of {}x{} pixels is too large to cache in full; this operation is not available.",
+                _session_id, _dims.width, _dims.height);
+            return false;
+        }
         _image_cache = MakeUniqueAlignedDataPtr<float>(_image_cache_size);
     }
 

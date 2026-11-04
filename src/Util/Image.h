@@ -49,6 +49,8 @@
 // raster image data
 #define TILE_SIZE 256
 #define CHUNK_SIZE 512
+// Largest image plane (pixels) cached in full for a loader that can serve tiles and mips itself (1 Gpixel, 4 GB)
+#define MAX_IMAGE_CACHE_PIXELS (static_cast<size_t>(1) << 30)
 
 // histograms
 #define AUTO_BIN_SIZE -1

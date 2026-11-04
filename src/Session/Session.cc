@@ -454,6 +454,7 @@ void Session::ApplyHealpixOptions(std::shared_ptr<FileLoader> loader, const CART
     options.width = healpix_options.width();
     options.height = healpix_options.height();
     options.bilinear = healpix_options.bilinear();
+    options.extend_sky = healpix_options.extend_sky();
     options.columns.assign(healpix_options.columns().begin(), healpix_options.columns().end());
 
     if (healpix_options.match_image()) {

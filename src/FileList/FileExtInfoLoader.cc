@@ -844,6 +844,9 @@ void FileExtInfoLoader::AddHealpixEntries(CARTA::FileInfoExtended& extended_info
     std::string reprojection;
     if (options.match_coord_sys) {
         reprojection = "matched to image";
+        if (options.extend_sky) {
+            reprojection += " (extended around it)";
+        }
     } else {
         reprojection = options.projection;
         if (!options.frame.empty()) {

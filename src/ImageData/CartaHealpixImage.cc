@@ -52,6 +52,7 @@ namespace {
 const double PI = M_PI;
 const double DEG2RAD = M_PI / 180.0;
 const unsigned int CURSOR_SIZE = 512;
+const int MAX_EXTENDED_SIDE = 131072; // pixels per side when a matched grid is extended to show the map around an image
 
 std::string UpperTrim(std::string s) {
     s.erase(0, s.find_first_not_of(" \t'"));
@@ -801,10 +802,17 @@ void CartaHealpixImage::SetUpCoordinateSystem() {
             pixel_order(1) = 0;
             matched.transpose(world_order, pixel_order);
         }
-        if ((_options.width > 0 && _options.width != width) || (_options.height > 0 && _options.height != height)) {
+        int new_width = _options.width > 0 ? _options.width : width;
+        int new_height = _options.height > 0 ? _options.height : height;
+        if (_options.extend_sky && _options.width <= 0 && _options.height <= 0) {
+            // Show the map around the image: enlarge the grid, centred on the image, out to where the projection stops
+            // being valid (a hemisphere for SIN, the cap for TAN or all-sky projections) at the image's pixel scale
+            auto extent = ExtendedGridSize(matched.directionCoordinate(), width, height);
+            new_width = extent.first;
+            new_height = extent.second;
+        }
+        if (new_width != width || new_height != height) {
             // A different grid size keeps the image's WCS and centres its grid in ours, so overlays still align
-            int new_width = _options.width > 0 ? _options.width : width;
-            int new_height = _options.height > 0 ? _options.height : height;
             casacore::DirectionCoordinate dir = matched.directionCoordinate();
             casacore::Vector<casacore::Double> refpix = dir.referencePixel();
             refpix(0) += (new_width - width) / 2.0;
@@ -943,6 +951,54 @@ bool CartaHealpixImage::AddMapAxisCoordinate(casacore::CoordinateSystem& coord_s
     return true;
 }
 
+std::pair<int, int> CartaHealpixImage::ExtendedGridSize(const casacore::DirectionCoordinate& direction, int width, int height) {
+    // Largest distance (in pixels) from the image centre along each grid axis at which pixels still convert to a sky
+    // position less than 90 degrees from the reference direction, found by bisection; capped per side.
+    const int max_half(MAX_EXTENDED_SIDE / 2);
+    const double cx = (width - 1) / 2.0, cy = (height - 1) / 2.0;
+    casacore::Vector<casacore::Double> ref = direction.referenceValue();
+    auto units = direction.worldAxisUnits();
+    const double lon_factor = casacore::Quantity(1.0, units(0)).getValue("rad");
+    const double lat_factor = casacore::Quantity(1.0, units(1)).getValue("rad");
+    casacore::MVDirection reference(ref(0) * lon_factor, ref(1) * lat_factor);
+
+    auto on_sky = [&](double x, double y) {
+        casacore::Vector<casacore::Double> pixel(2), world(2);
+        pixel(0) = x;
+        pixel(1) = y;
+        if (!direction.toWorld(world, pixel) || !std::isfinite(world(0)) || !std::isfinite(world(1))) {
+            return false;
+        }
+        casacore::MVDirection position(world(0) * lon_factor, world(1) * lat_factor);
+        return reference.separation(position) < PI / 2.0 - 1.0e-6;
+    };
+    auto reach = [&](double sx, double sy) { // along the direction (sx, sy) from the centre
+        int lo(0), hi(max_half);
+        while (lo < hi) {
+            int mid = (lo + hi + 1) / 2;
+            if (on_sky(cx + sx * mid, cy + sy * mid)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return lo;
+    };
+
+    int half_x = std::max(reach(1, 0), reach(-1, 0));
+    int half_y = std::max(reach(0, 1), reach(0, -1));
+    int new_width = std::max(width, std::min(MAX_EXTENDED_SIDE, 2 * half_x + 1));
+    int new_height = std::max(height, std::min(MAX_EXTENDED_SIDE, 2 * half_y + 1));
+    // Keep the image's pixels on the new grid's integer positions: the offset (new - old) / 2 must be a whole number
+    if ((new_width - width) % 2) {
+        new_width = (new_width < MAX_EXTENDED_SIDE) ? new_width + 1 : new_width - 1;
+    }
+    if ((new_height - height) % 2) {
+        new_height = (new_height < MAX_EXTENDED_SIDE) ? new_height + 1 : new_height - 1;
+    }
+    return {new_width, new_height};
+}
+
 void CartaHealpixImage::SetUpFrameRotation() {
     _needs_rotation = (_grid_frame != _map_frame);
     if (!_needs_rotation) {
@@ -1053,13 +1109,27 @@ casacore::Bool CartaHealpixImage::doGetSlice(casacore::Array<float>& buffer, con
     const size_t nx = length(0);
     const size_t ny = length(1);
     const size_t ncol = length.size() > 2 ? length(2) : 1;
-    const size_t npoints = nx * ny;
 
     if (!buffer.shape().isEqual(length)) {
         buffer.resize(length);
     }
-    if (npoints == 0) {
+    if (nx * ny == 0) {
         return false;
+    }
+
+    bool delete_it;
+    float* data = buffer.getStorage(delete_it);
+    Sample(blc(0), inc(0), nx, blc(1), inc(1), ny, length.size() > 2 ? blc(2) : 0, length.size() > 2 ? inc(2) : 1, ncol, data);
+    buffer.putStorage(data, delete_it);
+    // As for CartaFitsImage, the return value is used by FileLoader::GetSlice as a success flag
+    return true;
+}
+
+void CartaHealpixImage::Sample(double x0, double dx, size_t nx, double y0, double dy, size_t ny, size_t column0, size_t column_stride,
+    size_t ncol, float* data) const {
+    const size_t npoints = nx * ny;
+    if (npoints == 0) {
+        return;
     }
 
     // The direction coordinate's own pixel-axis order (the image may have latitude as its first axis when matched)
@@ -1075,16 +1145,13 @@ casacore::Bool CartaHealpixImage::doGetSlice(casacore::Array<float>& buffer, con
     const double lat_factor = casacore::Quantity(1.0, units(1)).getValue("rad");
     const double max_lat = PI / 2.0 + 1.0e-9;
 
-    // The section is processed in chunks of points, in parallel, so that a full-resolution plane of a large grid
-    // (tens of millions of pixels when matched to a survey image) never needs its coordinates held in memory at
-    // once. Each chunk converts with its own copy of the direction coordinate (casacore's is not thread-safe).
+    // The points are processed in chunks, in parallel, so that a full-resolution plane of a large grid (tens of
+    // millions of pixels when matched to a survey image) never needs its coordinates held in memory at once.
+    // Each chunk converts with its own copy of the direction coordinate (casacore's is not thread-safe).
     const size_t chunk_size(1 << 16);
     const size_t block_size(4096); // casacore's DirectionCoordinate::toWorldMany returns garbage for the points after
                                    // the first off-sky pixel of a batch, so any block with a failure is redone point by point
     const size_t num_chunks = (npoints + chunk_size - 1) / chunk_size;
-
-    bool delete_it;
-    float* data = buffer.getStorage(delete_it);
 
 #pragma omp parallel for schedule(dynamic)
     for (size_t chunk = 0; chunk < num_chunks; ++chunk) {
@@ -1099,8 +1166,8 @@ casacore::Bool CartaHealpixImage::doGetSlice(casacore::Array<float>& buffer, con
         // Grid pixel coordinates (0-based) of the chunk's points, x fastest
         for (size_t k = 0; k < nchunk; ++k) {
             const size_t p = chunk_start + k;
-            pixel(lon_row, k) = blc(0) + (p % nx) * inc(0);
-            pixel(lat_row, k) = blc(1) + (p / nx) * inc(1);
+            pixel(lon_row, k) = x0 + (p % nx) * dx;
+            pixel(lat_row, k) = y0 + (p / nx) * dy;
         }
 
         // Convert to world (radians)
@@ -1156,14 +1223,21 @@ casacore::Bool CartaHealpixImage::doGetSlice(casacore::Array<float>& buffer, con
         }
 
         for (size_t c = 0; c < ncol; ++c) {
-            size_t column = length.size() > 2 ? blc(2) + c * inc(2) : 0;
-            Lookup(lon.data(), lat.data(), valid, nchunk, column, data + c * npoints + chunk_start);
+            Lookup(lon.data(), lat.data(), valid, nchunk, column0 + c * column_stride, data + c * npoints + chunk_start);
         }
     }
+}
 
-    buffer.putStorage(data, delete_it);
-    // As for CartaFitsImage, the return value is used by FileLoader::GetSlice as a success flag
-    return true;
+size_t CartaHealpixImage::Npix() const {
+    return _info.npix();
+}
+
+std::shared_ptr<const std::vector<float>> CartaHealpixImage::MapValues(size_t map) const {
+    return _source ? _source->FullMap(map) : nullptr;
+}
+
+float CartaHealpixImage::MapValue(size_t map, int64_t pix) const {
+    return _source ? _source->Value(map, pix) : FLOAT_NAN;
 }
 
 void CartaHealpixImage::Lookup(
