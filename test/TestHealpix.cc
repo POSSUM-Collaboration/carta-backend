@@ -461,3 +461,58 @@ TEST_F(HealpixTest, FileInfoEntries) {
     }
     EXPECT_TRUE(has_ctype1);
 }
+
+TEST_F(HealpixTest, LargeSectionIsReadInChunksConsistently) {
+    // A section larger than the chunk size (2^18 points), with a stride and an offset, must equal the same
+    // pixels read in small pieces: chunk boundaries fall at arbitrary (x, y) positions
+    auto path = GeneratedPath("lonlat_ring_c.fits").string();
+    auto loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+    ASSERT_TRUE(loader);
+    HealpixProjectionOptions options;
+    options.projection = "MOL";
+    options.pixel_scale_deg = 0.25;
+    options.width = 1440;
+    options.height = 720;
+    options.columns = {"LON"};
+    loader->SetProjectionOptions(options);
+    loader->OpenFile("");
+    auto image = loader->GetImage();
+    ASSERT_TRUE(image);
+
+    casacore::Array<float> whole;
+    casacore::IPosition start(2, 3, 7), end(2, 1437, 715), stride(2, 1, 1);
+    image->doGetSlice(whole, casacore::Slicer(start, end, stride, casacore::Slicer::endIsLast));
+    ASSERT_EQ(whole.shape(), casacore::IPosition(2, 1435, 709));
+    ASSERT_GT(whole.shape().product(), 1 << 18);
+
+    size_t finite(0);
+    for (int y = 0; y < 709; y += 97) {
+        casacore::Array<float> row;
+        casacore::IPosition row_start(2, 3, 7 + y), row_end(2, 1437, 7 + y);
+        image->doGetSlice(row, casacore::Slicer(row_start, row_end, casacore::Slicer::endIsLast));
+        for (int x = 0; x < 1435; x += 13) {
+            float a = whole(casacore::IPosition(2, x, y));
+            float b = row(casacore::IPosition(2, x, 0));
+            if (std::isfinite(a) || std::isfinite(b)) {
+                ASSERT_TRUE(std::isfinite(a) && std::isfinite(b)) << "pixel " << x << "," << y;
+                ASSERT_FLOAT_EQ(a, b) << "pixel " << x << "," << y;
+                ++finite;
+            }
+        }
+    }
+    EXPECT_GT(finite, 500);
+
+    // A strided read picks the matching pixels of the full read
+    casacore::Array<float> strided;
+    casacore::IPosition stride3(2, 3, 2);
+    image->doGetSlice(strided, casacore::Slicer(start, end, stride3, casacore::Slicer::endIsLast));
+    for (int y = 0; y < static_cast<int>(strided.shape()(1)); y += 50) {
+        for (int x = 0; x < static_cast<int>(strided.shape()(0)); x += 50) {
+            float a = whole(casacore::IPosition(2, 3 * x, 2 * y));
+            float b = strided(casacore::IPosition(2, x, y));
+            if (std::isfinite(a) || std::isfinite(b)) {
+                ASSERT_FLOAT_EQ(a, b) << "strided pixel " << x << "," << y;
+            }
+        }
+    }
+}

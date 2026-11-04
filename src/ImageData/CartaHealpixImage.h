@@ -114,8 +114,7 @@ private:
     void ReadMap();
     void SetUpCoordinateSystem();
     void SetUpFrameRotation();
-    void Lookup(
-        const std::vector<double>& lon, const std::vector<double>& lat, const std::vector<bool>& valid, size_t column, float* out) const;
+    void Lookup(const double* lon, const double* lat, const std::vector<bool>& valid, size_t npoints, size_t column, float* out) const;
 
     std::string _filename;
     unsigned int _hdu;

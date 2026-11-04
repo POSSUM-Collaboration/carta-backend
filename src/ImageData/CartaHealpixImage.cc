@@ -650,8 +650,7 @@ casacore::Bool CartaHealpixImage::doGetSlice(casacore::Array<float>& buffer, con
         return false;
     }
 
-    // Grid pixel coordinates (0-based) of every point in the section, x fastest, in the direction
-    // coordinate's own pixel-axis order (the image may have latitude as its first axis when matched)
+    // The direction coordinate's own pixel-axis order (the image may have latitude as its first axis when matched)
     const auto& coord_sys = coordinates();
     const int dir_coord = coord_sys.directionCoordinateNumber();
     const casacore::DirectionCoordinate& direction = coord_sys.directionCoordinate();
@@ -659,100 +658,111 @@ casacore::Bool CartaHealpixImage::doGetSlice(casacore::Array<float>& buffer, con
     const int lon_row = (dir_pixel_axes(0) == 0) ? 0 : 1;
     const int lat_row = 1 - lon_row;
 
-    casacore::Matrix<casacore::Double> pixel(2, npoints, 0.0);
-    size_t k(0);
-    for (size_t j = 0; j < ny; ++j) {
-        double y = blc(1) + j * inc(1);
-        for (size_t i = 0; i < nx; ++i, ++k) {
-            pixel(lon_row, k) = blc(0) + i * inc(0);
-            pixel(lat_row, k) = y;
-        }
-    }
-
-    // Convert to world (radians) in blocks. casacore's DirectionCoordinate::toWorldMany returns garbage for the
-    // points after the first off-sky pixel of a batch, so any block with a failure is redone point by point.
     auto units = direction.worldAxisUnits();
     const double lon_factor = casacore::Quantity(1.0, units(0)).getValue("rad");
     const double lat_factor = casacore::Quantity(1.0, units(1)).getValue("rad");
     const double max_lat = PI / 2.0 + 1.0e-9;
 
-    std::vector<double> lon(npoints), lat(npoints);
-    std::vector<bool> valid(npoints, false);
-    const size_t block_size(4096);
-    casacore::Vector<casacore::Double> one_pixel(2), one_world(2);
-
-    for (size_t block_start = 0; block_start < npoints; block_start += block_size) {
-        const size_t block_end = std::min(npoints, block_start + block_size);
-        const size_t n = block_end - block_start;
-        casacore::Matrix<casacore::Double> block_pixel = pixel(casacore::Slice(0, 2), casacore::Slice(block_start, n));
-        casacore::Matrix<casacore::Double> world;
-        casacore::Vector<casacore::Bool> failures;
-
-        if (direction.toWorldMany(world, block_pixel, failures)) {
-            for (size_t i = 0; i < n; ++i) {
-                lon[block_start + i] = world(0, i) * lon_factor;
-                lat[block_start + i] = world(1, i) * lat_factor;
-                valid[block_start + i] = true;
-            }
-        } else {
-            for (size_t i = 0; i < n; ++i) {
-                one_pixel(0) = block_pixel(0, i);
-                one_pixel(1) = block_pixel(1, i);
-                if (direction.toWorld(one_world, one_pixel)) {
-                    lon[block_start + i] = one_world(0) * lon_factor;
-                    lat[block_start + i] = one_world(1) * lat_factor;
-                    valid[block_start + i] = true;
-                }
-            }
-        }
-    }
-
-    for (size_t p = 0; p < npoints; ++p) {
-        if (!valid[p]) {
-            continue;
-        }
-        if (!std::isfinite(lon[p]) || !std::isfinite(lat[p]) || std::abs(lat[p]) > max_lat) {
-            valid[p] = false;
-        } else {
-            lat[p] = std::max(-PI / 2.0, std::min(PI / 2.0, lat[p]));
-        }
-    }
-
-    if (_needs_rotation) {
-        for (size_t p = 0; p < npoints; ++p) {
-            if (!valid[p]) {
-                continue;
-            }
-            double cl = std::cos(lat[p]);
-            double v0 = cl * std::cos(lon[p]), v1 = cl * std::sin(lon[p]), v2 = std::sin(lat[p]);
-            double r0 = _rotation(0, 0) * v0 + _rotation(0, 1) * v1 + _rotation(0, 2) * v2;
-            double r1 = _rotation(1, 0) * v0 + _rotation(1, 1) * v1 + _rotation(1, 2) * v2;
-            double r2 = _rotation(2, 0) * v0 + _rotation(2, 1) * v1 + _rotation(2, 2) * v2;
-            lon[p] = std::atan2(r1, r0);
-            lat[p] = std::asin(std::max(-1.0, std::min(1.0, r2)));
-        }
-    }
+    // The section is processed in chunks of points, in parallel, so that a full-resolution plane of a large grid
+    // (tens of millions of pixels when matched to a survey image) never needs its coordinates held in memory at
+    // once. Each chunk converts with its own copy of the direction coordinate (casacore's is not thread-safe).
+    const size_t chunk_size(1 << 16);
+    const size_t block_size(4096); // casacore's DirectionCoordinate::toWorldMany returns garbage for the points after
+                                   // the first off-sky pixel of a batch, so any block with a failure is redone point by point
+    const size_t num_chunks = (npoints + chunk_size - 1) / chunk_size;
 
     bool delete_it;
     float* data = buffer.getStorage(delete_it);
-    for (size_t c = 0; c < ncol; ++c) {
-        size_t column = length.size() > 2 ? blc(2) + c * inc(2) : 0;
-        Lookup(lon, lat, valid, column, data + c * npoints);
+
+#pragma omp parallel for schedule(dynamic)
+    for (size_t chunk = 0; chunk < num_chunks; ++chunk) {
+        const size_t chunk_start = chunk * chunk_size;
+        const size_t nchunk = std::min(chunk_size, npoints - chunk_start);
+        casacore::DirectionCoordinate direction_copy(direction);
+        casacore::Matrix<casacore::Double> pixel(2, nchunk, 0.0);
+        std::vector<double> lon(nchunk), lat(nchunk);
+        std::vector<bool> valid(nchunk, false);
+        casacore::Vector<casacore::Double> one_pixel(2), one_world(2);
+
+        // Grid pixel coordinates (0-based) of the chunk's points, x fastest
+        for (size_t k = 0; k < nchunk; ++k) {
+            const size_t p = chunk_start + k;
+            pixel(lon_row, k) = blc(0) + (p % nx) * inc(0);
+            pixel(lat_row, k) = blc(1) + (p / nx) * inc(1);
+        }
+
+        // Convert to world (radians)
+        for (size_t block_start = 0; block_start < nchunk; block_start += block_size) {
+            const size_t n = std::min(nchunk, block_start + block_size) - block_start;
+            casacore::Matrix<casacore::Double> block_pixel = pixel(casacore::Slice(0, 2), casacore::Slice(block_start, n));
+            casacore::Matrix<casacore::Double> world;
+            casacore::Vector<casacore::Bool> failures;
+
+            if (direction_copy.toWorldMany(world, block_pixel, failures)) {
+                for (size_t i = 0; i < n; ++i) {
+                    lon[block_start + i] = world(0, i) * lon_factor;
+                    lat[block_start + i] = world(1, i) * lat_factor;
+                    valid[block_start + i] = true;
+                }
+            } else {
+                for (size_t i = 0; i < n; ++i) {
+                    one_pixel(0) = block_pixel(0, i);
+                    one_pixel(1) = block_pixel(1, i);
+                    if (direction_copy.toWorld(one_world, one_pixel)) {
+                        lon[block_start + i] = one_world(0) * lon_factor;
+                        lat[block_start + i] = one_world(1) * lat_factor;
+                        valid[block_start + i] = true;
+                    }
+                }
+            }
+        }
+
+        for (size_t k = 0; k < nchunk; ++k) {
+            if (!valid[k]) {
+                continue;
+            }
+            if (!std::isfinite(lon[k]) || !std::isfinite(lat[k]) || std::abs(lat[k]) > max_lat) {
+                valid[k] = false;
+            } else {
+                lat[k] = std::max(-PI / 2.0, std::min(PI / 2.0, lat[k]));
+            }
+        }
+
+        if (_needs_rotation) {
+            for (size_t k = 0; k < nchunk; ++k) {
+                if (!valid[k]) {
+                    continue;
+                }
+                double cl = std::cos(lat[k]);
+                double v0 = cl * std::cos(lon[k]), v1 = cl * std::sin(lon[k]), v2 = std::sin(lat[k]);
+                double r0 = _rotation(0, 0) * v0 + _rotation(0, 1) * v1 + _rotation(0, 2) * v2;
+                double r1 = _rotation(1, 0) * v0 + _rotation(1, 1) * v1 + _rotation(1, 2) * v2;
+                double r2 = _rotation(2, 0) * v0 + _rotation(2, 1) * v1 + _rotation(2, 2) * v2;
+                lon[k] = std::atan2(r1, r0);
+                lat[k] = std::asin(std::max(-1.0, std::min(1.0, r2)));
+            }
+        }
+
+        for (size_t c = 0; c < ncol; ++c) {
+            size_t column = length.size() > 2 ? blc(2) + c * inc(2) : 0;
+            Lookup(lon.data(), lat.data(), valid, nchunk, column, data + c * npoints + chunk_start);
+        }
     }
+
     buffer.putStorage(data, delete_it);
     // As for CartaFitsImage, the return value is used by FileLoader::GetSlice as a success flag
     return true;
 }
 
 void CartaHealpixImage::Lookup(
-    const std::vector<double>& lon, const std::vector<double>& lat, const std::vector<bool>& valid, size_t column, float* out) const {
+    const double* lon, const double* lat, const std::vector<bool>& valid, size_t npoints, size_t column, float* out) const {
     if (column >= _maps.size()) {
-        std::fill(out, out + lon.size(), FLOAT_NAN);
+        std::fill(out, out + npoints, FLOAT_NAN);
         return;
     }
     const std::vector<float>& map = *_maps[column];
 
-    for (size_t p = 0; p < lon.size(); ++p) {
+    for (size_t p = 0; p < npoints; ++p) {
         if (!valid[p]) {
             out[p] = FLOAT_NAN;
             continue;
