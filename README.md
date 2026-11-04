@@ -119,6 +119,52 @@ cmake ..
 make -j8
 ```
 
+# Running the POSSUM fork on a Mac with `container` (or Docker)
+
+This fork publishes a ready-to-run image (backend and frontend together) for every branch, built by the
+[Build binaries](.github/workflows/build_binaries.yml) workflow: `ghcr.io/possum-collaboration/carta:<branch>`,
+e.g. `ghcr.io/possum-collaboration/carta:feature-combined` for the branch with both the N-dimensional axes and
+HEALPix work. Images exist for arm64 (Apple Silicon) and amd64, so no emulation is needed on a Mac.
+
+With Apple's [`container`](https://github.com/apple/container) tool (macOS 26 or later):
+
+```bash
+# once: start the container service
+container system start
+
+# pull the image (repeat after every rebuild of the branch, because the tag is reused)
+container image pull ghcr.io/possum-collaboration/carta:feature-combined
+
+# run it with a folder of images mounted at /images
+container run --rm --memory 4g -p 3002:3002 \
+    -v /path/to/your/images:/images \
+    ghcr.io/possum-collaboration/carta:feature-combined
+```
+
+The backend prints a line like `CARTA is accessible at http://localhost:3002/?token=...`; open that URL in a
+browser. The file browser starts in `/images`, which is the folder you mounted. Stop it with Ctrl-C.
+
+Notes:
+
+* `--memory 4g` (or more) is worth giving it: a large image and a HEALPix map reprojected onto its grid both keep a
+  full-resolution plane in memory. The default container memory is small enough to kill the backend silently.
+* Do not pass `--arch amd64`: the image is multi-architecture and the native arm64 variant is picked up by default.
+* To be sure you are running a particular build rather than whatever the tag resolved to last time, use the
+  build-specific tag listed on the [Releases](https://github.com/POSSUM-Collaboration/carta-backend/releases) page,
+  e.g. `ghcr.io/possum-collaboration/carta:feature-combined-8b1373d9`.
+* If the pull is refused with "denied" or "unauthorized", the package is not public; log in with a GitHub token that
+  can read packages: `container registry login ghcr.io` (or `docker login ghcr.io`).
+
+With Docker Desktop the commands are the same with `docker` in place of `container`:
+
+```bash
+docker pull ghcr.io/possum-collaboration/carta:feature-combined
+docker run --rm --memory 4g -p 3002:3002 -v /path/to/your/images:/images ghcr.io/possum-collaboration/carta:feature-combined
+```
+
+The Releases page also carries Linux tarballs of the same builds (`carta-<branch>-linux-{amd64,arm64}.tar.gz`) for
+running natively on Ubuntu 24.04 without a container; see the README inside the tarball.
+
 # Running the backend process
 
 The packages provide a `carta` script which wraps the `carta_backend` executable. Both are available on the path. In the source build, the `carta_backend` executable can be found in the `build` directory.
