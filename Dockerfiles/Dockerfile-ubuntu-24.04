@@ -6,7 +6,7 @@ RUN \
   apt-get -y upgrade && \
   DEBIAN_FRONTEND=noninteractive \
   apt-get install -y apt-utils autoconf bison build-essential cmake curl libfftw3-dev flex gcc g++ \
-    gdb gfortran git git-lfs libgmock-dev googletest libblas-dev libcfitsio-dev \
+    gdb gfortran git git-lfs libgmock-dev googletest libblas-dev libcfitsio-dev libhealpix-cxx-dev \
     libgsl-dev libgtest-dev libhdf5-dev liblapack-dev libncurses-dev \
     libprotobuf-dev libreadline-dev libssl-dev libstarlink-ast-dev \
     libtool libxml2-dev libxslt1-dev  libzfp-dev libzstd-dev pkg-config protobuf-compiler \

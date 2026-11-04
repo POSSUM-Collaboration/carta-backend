@@ -25,6 +25,7 @@
 #include "FileList/FitsHduList.h"
 #include "ImageData/CompressedFits.h"
 #include "ImageData/FitsLoader.h"
+#include "ImageData/HealpixLoader.h"
 #include "ImageGenerators/ImageGenerator.h"
 #include "Logger/Logger.h"
 #include "OnMessageTask.h"
@@ -177,7 +178,7 @@ void Session::ConnectCalled() {
 
 bool Session::FillExtendedFileInfo(std::map<std::string, CARTA::FileInfoExtended>& hdu_info_map, CARTA::FileInfo& file_info,
     const std::string& folder, const std::string& filename, const std::string& hdu, bool support_aips_beam, std::string& message,
-    const std::vector<int>& axis_order) {
+    const std::vector<int>& axis_order, const CARTA::HealpixOptions* healpix_options) {
     // Fill CARTA::FileInfo and CARTA::FileInfoExtended
     // Map all hdus if no hdu_name supplied and FITS image
     bool file_info_ok(false);
@@ -197,6 +198,9 @@ bool Session::FillExtendedFileInfo(std::map<std::string, CARTA::FileInfoExtended
         }
         loader->SetAipsBeamSupport(support_aips_beam);
         loader->SetAxisOrder(axis_order);
+        if (healpix_options) {
+            ApplyHealpixOptions(loader, *healpix_options);
+        }
         FileExtInfoLoader ext_info_loader(loader);
 
         std::string requested_hdu(hdu);
@@ -237,7 +241,7 @@ bool Session::FillExtendedFileInfo(std::map<std::string, CARTA::FileInfoExtended
 
 bool Session::FillExtendedFileInfo(CARTA::FileInfoExtended& extended_info, CARTA::FileInfo& file_info, const std::string& folder,
     const std::string& filename, std::string& hdu, bool support_aips_beam, std::string& message, std::string& fullname,
-    const std::vector<int>& axis_order) {
+    const std::vector<int>& axis_order, const CARTA::HealpixOptions* healpix_options) {
     // Fill FileInfoExtended for given file and hdu_name (may include extension name)
     bool file_info_ok(false);
 
@@ -255,6 +259,9 @@ bool Session::FillExtendedFileInfo(CARTA::FileInfoExtended& extended_info, CARTA
         }
         loader->SetAipsBeamSupport(support_aips_beam);
         loader->SetAxisOrder(axis_order);
+        if (healpix_options) {
+            ApplyHealpixOptions(loader, *healpix_options);
+        }
         FileExtInfoLoader ext_info_loader = FileExtInfoLoader(loader);
 
         // Discern hdu for extended file info
@@ -425,14 +432,52 @@ void Session::OnFileListRequest(const CARTA::FileListRequest& request, uint32_t 
     }
 }
 
+void Session::ApplyHealpixOptions(std::shared_ptr<FileLoader> loader, const CARTA::HealpixOptions& healpix_options) {
+    // Convert the request's reprojection settings for a HEALPix loader; other loaders are unaffected
+    auto healpix_loader = std::dynamic_pointer_cast<HealpixLoader>(loader);
+    if (!healpix_loader) {
+        return;
+    }
+
+    HealpixProjectionOptions options;
+    if (!healpix_options.projection().empty()) {
+        options.projection = healpix_options.projection();
+    }
+    options.frame = healpix_options.frame();
+    if (healpix_options.has_center()) {
+        options.center_lon_deg = healpix_options.center_lon();
+        options.center_lat_deg = healpix_options.center_lat();
+    }
+    if (healpix_options.pixel_scale() > 0.0) {
+        options.pixel_scale_deg = healpix_options.pixel_scale();
+    }
+    options.width = healpix_options.width();
+    options.height = healpix_options.height();
+    options.bilinear = healpix_options.bilinear();
+    options.columns.assign(healpix_options.columns().begin(), healpix_options.columns().end());
+
+    if (healpix_options.match_image()) {
+        auto match_file_id = healpix_options.match_file_id();
+        std::unique_lock<std::mutex> lock(_frame_mutex);
+        if (_frames.count(match_file_id) && _frames.at(match_file_id)->IsValid()) {
+            options.match_coord_sys = _frames.at(match_file_id)->CoordinateSystem();
+            options.match_shape = _frames.at(match_file_id)->ImageShape();
+        } else {
+            spdlog::warn("Session {}: cannot match HEALPix map to file id {}, which is not open.", _id, match_file_id);
+        }
+    }
+
+    healpix_loader->SetProjectionOptions(options);
+}
+
 void Session::OnFileInfoRequest(const CARTA::FileInfoRequest& request, uint32_t request_id) {
     CARTA::FileInfoResponse response;
     auto& file_info = *response.mutable_file_info();
     std::map<std::string, CARTA::FileInfoExtended> extended_info_map;
     string message;
     std::vector<int> axis_order(request.axis_order().begin(), request.axis_order().end());
-    bool success = FillExtendedFileInfo(
-        extended_info_map, file_info, request.directory(), request.file(), request.hdu(), request.support_aips_beam(), message, axis_order);
+    bool success = FillExtendedFileInfo(extended_info_map, file_info, request.directory(), request.file(), request.hdu(),
+        request.support_aips_beam(), message, axis_order, request.has_healpix() ? &request.healpix() : nullptr);
 
     if (success) {
         // add extended info map to message
@@ -508,8 +553,8 @@ bool Session::OnOpenFile(const CARTA::OpenFile& message, uint32_t request_id, bo
         CARTA::FileInfo file_info;
         CARTA::FileInfoExtended file_info_extended;
         std::vector<int> axis_order(message.axis_order().begin(), message.axis_order().end());
-        bool info_loaded = FillExtendedFileInfo(
-            file_info_extended, file_info, directory, filename, hdu, support_aips_beam, err_message, fullname, axis_order);
+        bool info_loaded = FillExtendedFileInfo(file_info_extended, file_info, directory, filename, hdu, support_aips_beam, err_message,
+            fullname, axis_order, message.has_healpix() ? &message.healpix() : nullptr);
 
         if (info_loaded) {
             // Get or create loader for frame

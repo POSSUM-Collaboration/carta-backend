@@ -21,6 +21,7 @@
 #include "ExprLoader.h"
 #include "FitsLoader.h"
 #include "Hdf5Loader.h"
+#include "HealpixLoader.h"
 #include "ImagePtrLoader.h"
 #include "MiriadLoader.h"
 #include "PolarizationCalculator.h"
@@ -33,6 +34,9 @@ std::shared_ptr<FileLoader> FileLoader::GetLoader(const std::string& filename, c
         // filename is LEL expression for image(s) in directory
         return std::make_shared<ExprLoader>(filename, directory);
     } else if (IsCompressedFits(filename)) {
+        if (CartaHealpixImage::IsHealpixFile(filename)) {
+            return std::make_shared<HealpixLoader>(filename); // cfitsio reads the gzipped maps
+        }
         return std::make_shared<FitsLoader>(filename, true);
     } else if (IsRemoteHttpFile(filename)) {
         return std::make_shared<FitsLoader>(filename, false, true);
@@ -42,6 +46,9 @@ std::shared_ptr<FileLoader> FileLoader::GetLoader(const std::string& filename, c
         case casacore::ImageOpener::AIPSPP:
             return std::make_shared<CasaLoader>(filename);
         case casacore::ImageOpener::FITS:
+            if (CartaHealpixImage::IsHealpixFile(filename)) {
+                return std::make_shared<HealpixLoader>(filename);
+            }
             return std::make_shared<FitsLoader>(filename);
         case casacore::ImageOpener::MIRIAD:
             return std::make_shared<MiriadLoader>(filename);
@@ -384,8 +391,8 @@ bool FileLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stok
         }
 
         auto image_type = image->imageType();
-        if (image_type == "CartaFitsImage") {
-            // Use cfitsio for slice
+        if (image_type == "CartaFitsImage" || image_type == "CartaHealpixImage") {
+            // Use cfitsio for slice, or reproject the HEALPix map directly (blanks are NaN)
             return image->doGetSlice(data, slicer);
         } else if (image_type == "ImageExpr") {
             // Use ImageExpr for slice

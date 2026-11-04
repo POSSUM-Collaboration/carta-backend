@@ -25,6 +25,7 @@
 
 #include "../ImageData/CartaFitsImage.h"
 #include "../ImageData/CartaHdf5Image.h"
+#include "../ImageData/CartaHealpixImage.h"
 #include "../ImageData/TransposedImage.h"
 #include "FileList/FitsHduList.h"
 #include "Logger/Logger.h"
@@ -247,6 +248,10 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
 
                     // Computed entries for rendered image axes, depth axis (may not be spectral), stokes axis
                     AddComputedEntries(extended_info, image.get(), axes, use_image_for_entries, is_history_beam);
+
+                    if (image_type == "CartaHealpixImage") {
+                        AddHealpixEntries(extended_info, header_image.get()); // the map itself, inside any transposed view
+                    }
                     info_ok = true;
                 }
             } else { // image failed
@@ -801,6 +806,55 @@ void FileExtInfoLoader::AddAxisInfo(CARTA::FileInfoExtended& extended_info, cons
             }
         }
     }
+}
+
+void FileExtInfoLoader::AddHealpixEntries(CARTA::FileInfoExtended& extended_info, casacore::ImageInterface<float>* image) {
+    // Computed entries describing the HEALPix map and how it was reprojected
+    auto healpix_image = dynamic_cast<CartaHealpixImage*>(image);
+    if (!healpix_image) {
+        return;
+    }
+    const auto& info = healpix_image->MapInfo();
+    const auto& options = healpix_image->Options();
+
+    Message::AddComputedEntry(extended_info, "HEALPix NSIDE", std::to_string(info.nside), CARTA::EntryType::INT, info.nside);
+    Message::AddComputedEntry(extended_info, "HEALPix ordering", info.nested ? "NESTED" : "RING");
+    Message::AddComputedEntry(extended_info, "HEALPix coverage", info.object.empty() ? "FULLSKY" : info.object);
+    Message::AddComputedEntry(extended_info, "HEALPix frame", info.coordsys.empty() ? "C (assumed)" : info.coordsys);
+    Message::AddComputedEntry(extended_info, "HEALPix resolution", fmt::format("{:.4g} arcmin", info.resolution_deg() * 60.0));
+
+    std::string columns;
+    for (size_t i = 0; i < info.columns.size(); ++i) {
+        columns += (i ? ", " : "") + info.columns[i];
+        if (!info.column_units[i].empty()) {
+            columns += " [" + info.column_units[i] + "]";
+        }
+    }
+    Message::AddComputedEntry(extended_info, "HEALPix columns", columns);
+    if (info.image_format) {
+        std::string maps = std::to_string(info.num_maps);
+        if (info.has_map_axis()) {
+            double first = info.map_axis_crval + (1 - info.map_axis_crpix) * info.map_axis_cdelt;
+            double last = info.map_axis_crval + (info.num_maps - info.map_axis_crpix) * info.map_axis_cdelt;
+            maps += fmt::format(" ({} {:.6g} to {:.6g} {})", info.map_axis_ctype, first, last, info.map_axis_unit);
+        }
+        Message::AddComputedEntry(extended_info, "HEALPix maps", maps);
+    }
+
+    std::string reprojection;
+    if (options.match_coord_sys) {
+        reprojection = "matched to image";
+    } else {
+        reprojection = options.projection;
+        if (!options.frame.empty()) {
+            reprojection += ", frame " + options.frame;
+        }
+        double scale =
+            std::isnan(options.pixel_scale_deg) || options.pixel_scale_deg <= 0 ? info.resolution_deg() : options.pixel_scale_deg;
+        reprojection += fmt::format(", {:.4g} arcmin/pixel", scale * 60.0);
+    }
+    reprojection += options.bilinear ? ", bilinear" : ", nearest";
+    Message::AddComputedEntry(extended_info, "HEALPix reprojection", reprojection);
 }
 
 void FileExtInfoLoader::AddShapeEntries(CARTA::FileInfoExtended& extended_info, const casacore::IPosition& shape, const AxesInfo& axes,
