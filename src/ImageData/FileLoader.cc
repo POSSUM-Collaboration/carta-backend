@@ -394,8 +394,9 @@ bool FileLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stok
         if (image_type == "CartaFitsImage" || image_type == "CartaHealpixImage") {
             // Use cfitsio for slice, or reproject the HEALPix map directly (blanks are NaN)
             return image->doGetSlice(data, slicer);
-        } else if (image_type == "ImageExpr") {
-            // Use ImageExpr for slice
+        } else if (image_type == "ImageExpr" || image_type == "TransposedImage") {
+            // One whole-section read: ImageExpr evaluates it; TransposedImage reads the wrapped image in file order and
+            // reorders (iterating it by cursor would re-read a permuted view one line at a time)
             casacore::Array<float> slice_data;
             image->doGetSlice(slice_data, slicer);
 
