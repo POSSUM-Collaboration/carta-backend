@@ -23,6 +23,7 @@
 #include "ImageData/CartaHealpixImage.h"
 #include "ImageData/FileLoader.h"
 #include "ImageData/HealpixLoader.h"
+#include "Region/RegionHandler.h"
 
 using namespace carta;
 
@@ -247,12 +248,14 @@ TEST_F(HealpixTest, DefaultMollweideGrid) {
     ASSERT_TRUE(image);
     EXPECT_EQ(image->imageType(), "CartaHealpixImage");
 
-    // Default grid: all-sky at the HEALPix resolution, columns on a linear axis
+    // Default grid: the whole Mollweide ellipse (2 sqrt(2) by sqrt(2) radians) plus a pixel of margin, at the HEALPix
+    // resolution, with the reference pixel at the centre; columns on a linear axis
     auto shape = image->shape();
     ASSERT_EQ(shape.size(), 3);
-    EXPECT_EQ(shape(0), static_cast<int>(std::ceil(360.0 / 1.8323)));
-    EXPECT_EQ(shape(1), static_cast<int>(std::ceil(180.0 / 1.8323)));
+    EXPECT_EQ(shape(0), 2 * (static_cast<int>(std::floor(2.0 * std::sqrt(2.0) * DEG / 1.8323)) + 1) + 1);
+    EXPECT_EQ(shape(1), 2 * (static_cast<int>(std::floor(std::sqrt(2.0) * DEG / 1.8323)) + 1) + 1);
     EXPECT_EQ(shape(2), 2);
+    EXPECT_EQ(image->coordinates().directionCoordinate().referencePixel()(0), (shape(0) - 1) / 2.0);
     EXPECT_TRUE(image->coordinates().hasDirectionCoordinate());
     EXPECT_FALSE(image->coordinates().hasPolarizationAxis());
     EXPECT_EQ(image->coordinates().directionCoordinate().projection().name(), "MOL");
@@ -292,6 +295,55 @@ TEST_F(HealpixTest, DefaultMollweideGrid) {
     }
     EXPECT_GT(on_sky, 100);
     EXPECT_GT(off_sky, 10); // Mollweide corners are off the sky
+}
+
+TEST_F(HealpixTest, DefaultGridCoversTheWholeProjection) {
+    // The default grid reaches the edge of the projection along each axis, plus a pixel of margin: the hemisphere of
+    // SIN (1 radian), the whole sphere of ZEA (2 radians), the ellipses of MOL and AIT, 360 by 180 degrees of CAR;
+    // TAN, unbounded, is capped at 360 degrees across
+    auto path = GeneratedPath("lonlat_ring_c.fits").string();
+    const double scale = 1.8323;
+    auto expected = [&](double reach_deg) { return 2 * (static_cast<int>(std::floor(reach_deg / scale)) + 1) + 1; };
+    const int capped = 2 * (static_cast<int>(std::ceil(180.0 / scale)) + 1) + 1;
+    struct Case {
+        std::string projection;
+        int width, height;
+    };
+    const std::vector<Case> cases = {{"SIN", expected(DEG), expected(DEG)}, {"ZEA", expected(2 * DEG), expected(2 * DEG)},
+        {"MOL", expected(2 * std::sqrt(2.0) * DEG), expected(std::sqrt(2.0) * DEG)},
+        {"AIT", expected(2 * std::sqrt(2.0) * DEG), expected(std::sqrt(2.0) * DEG)}, {"CAR", expected(180.0), expected(90.0)},
+        {"TAN", capped, capped}};
+
+    for (const auto& c : cases) {
+        auto loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+        ASSERT_TRUE(loader);
+        HealpixProjectionOptions options;
+        options.projection = c.projection;
+        options.columns = {"LON"};
+        loader->SetProjectionOptions(options);
+        loader->OpenFile("1");
+        auto image = loader->GetImage();
+        ASSERT_TRUE(image) << c.projection;
+        auto shape = image->shape();
+        EXPECT_EQ(shape(0), c.width) << c.projection;
+        EXPECT_EQ(shape(1), c.height) << c.projection;
+
+        // Along the row and column through the centre, every pixel but the margin is on the sky
+        casacore::Array<float> row, column;
+        const int cx = (shape(0) - 1) / 2, cy = (shape(1) - 1) / 2;
+        image->doGetSlice(row, casacore::Slicer(casacore::IPosition(2, 0, cy), casacore::IPosition(2, shape(0), 1)));
+        image->doGetSlice(column, casacore::Slicer(casacore::IPosition(2, cx, 0), casacore::IPosition(2, 1, shape(1))));
+        for (int x = 1; x < shape(0) - 1; ++x) {
+            EXPECT_TRUE(std::isfinite(row(casacore::IPosition(2, x, 0)))) << c.projection << " x " << x;
+        }
+        for (int y = 1; y < shape(1) - 1; ++y) {
+            EXPECT_TRUE(std::isfinite(column(casacore::IPosition(2, 0, y)))) << c.projection << " y " << y;
+        }
+        if (c.projection != "TAN" && c.projection != "CAR") { // the margin is off the sky (CAR wraps round, TAN goes on)
+            EXPECT_TRUE(std::isnan(row(casacore::IPosition(2, 0, 0)))) << c.projection;
+            EXPECT_TRUE(std::isnan(row(casacore::IPosition(2, shape(0) - 1, 0)))) << c.projection;
+        }
+    }
 }
 
 TEST_F(HealpixTest, StokesColumnsAndFrame) {
@@ -601,8 +653,10 @@ TEST_F(HealpixTest, ImageFormatCubeOpensAsSpectralCube) {
         ASSERT_TRUE(image);
         auto shape = image->shape();
         ASSERT_EQ(shape.size(), 3) << name;
-        EXPECT_EQ(shape(0), 180);
-        EXPECT_EQ(shape(1), 90);
+        const int width = 2 * (static_cast<int>(std::floor(2.0 * std::sqrt(2.0) * DEG / 2.0)) + 1) + 1; // the Mollweide ellipse
+        const int height = 2 * (static_cast<int>(std::floor(std::sqrt(2.0) * DEG / 2.0)) + 1) + 1;
+        EXPECT_EQ(shape(0), width);
+        EXPECT_EQ(shape(1), height);
         EXPECT_EQ(shape(2), 3);
         EXPECT_EQ(image->units().getName(), "K");
         EXPECT_FALSE(image->imageInfo().restoringBeam().isNull());
@@ -618,13 +672,13 @@ TEST_F(HealpixTest, ImageFormatCubeOpensAsSpectralCube) {
 
         // Map k holds LON + 1000 k: read channel 2 and compare with the grid's own longitudes
         casacore::Array<float> data;
-        casacore::IPosition start(3, 0, 0, 2), end(3, 179, 89, 2);
+        casacore::IPosition start(3, 0, 0, 2), end(3, width - 1, height - 1, 2);
         image->doGetSlice(data, casacore::Slicer(start, end, casacore::Slicer::endIsLast));
         const auto& dir = coord_sys.directionCoordinate();
         const double resolution = 3.66; // deg at NSIDE=16
         int checked(0);
-        for (int y = 5; y < 90; y += 10) {
-            for (int x = 5; x < 180; x += 15) {
+        for (int y = 5; y < height; y += 10) {
+            for (int x = 5; x < width; x += 15) {
                 casacore::Vector<double> pixel(2), world(2);
                 pixel(0) = x;
                 pixel(1) = y;
@@ -643,7 +697,7 @@ TEST_F(HealpixTest, ImageFormatCubeOpensAsSpectralCube) {
 
         // A spectrum through one position reads every map; map 0 has an UNSEEN pixel that becomes NaN
         casacore::Array<float> spectrum;
-        casacore::IPosition spec_start(3, 90, 45, 0), spec_end(3, 90, 45, 2);
+        casacore::IPosition spec_start(3, width / 2, height / 2, 0), spec_end(3, width / 2, height / 2, 2);
         image->doGetSlice(spectrum, casacore::Slicer(spec_start, spec_end, casacore::Slicer::endIsLast));
         ASSERT_EQ(spectrum.shape(), casacore::IPosition(3, 1, 1, 3));
         float v0 = spectrum(casacore::IPosition(3, 0, 0, 0)), v1 = spectrum(casacore::IPosition(3, 0, 0, 1)),
@@ -655,7 +709,117 @@ TEST_F(HealpixTest, ImageFormatCubeOpensAsSpectralCube) {
         std::unique_ptr<Frame> frame(new Frame(0, loader, "0"));
         ASSERT_TRUE(frame->IsValid()) << frame->GetErrorMessage();
         EXPECT_EQ(frame->Depth(), 3);
-        EXPECT_EQ(frame->Width(), 180);
+        EXPECT_EQ(frame->Width(), width);
+    }
+}
+
+TEST_F(HealpixTest, CubeSpectralProfilesComeFromTheLoader) {
+    // Through a cube, the loader converts the cursor or region to map pixels once and reads every map: the profiles
+    // must match those from the reprojected planes
+    auto path = GeneratedPath("cube_image_format.fits").string();
+    auto loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+    ASSERT_TRUE(loader);
+    HealpixProjectionOptions options;
+    options.pixel_scale_deg = 2.0;
+    loader->SetProjectionOptions(options);
+    loader->OpenFile("");
+    auto image = loader->GetImage();
+    ASSERT_TRUE(image);
+    auto shape = image->shape();
+    std::shared_ptr<Frame> frame(new Frame(0, loader, "0"));
+    ASSERT_TRUE(frame->IsValid()) << frame->GetErrorMessage();
+    std::mutex mutex;
+    EXPECT_TRUE(loader->UseRegionSpectralData(casacore::IPosition(2, 5, 5), mutex));
+
+    // The planes of a box around the centre, read directly
+    const int x0 = shape(0) / 2 - 7, y0 = shape(1) / 2 - 4, box_width = 15, box_height = 9, depth = shape(2);
+    casacore::Array<float> box;
+    image->doGetSlice(box, casacore::Slicer(casacore::IPosition(3, x0, y0, 0), casacore::IPosition(3, box_width, box_height, depth)));
+
+    // Cursor profile at the box corner
+    std::vector<float> cursor_profile;
+    ASSERT_TRUE(loader->GetCursorSpectralData(cursor_profile, 0, x0, 1, y0, 1, mutex));
+    ASSERT_EQ(cursor_profile.size(), depth);
+    for (int z = 0; z < depth; ++z) {
+        EXPECT_FLOAT_EQ(cursor_profile[z], box(casacore::IPosition(3, 0, 0, z))) << "channel " << z;
+    }
+
+    // Region profile for a mask covering the box except its first column; every channel in one pass
+    casacore::Array<casacore::Bool> mask_array(casacore::IPosition(2, box_width, box_height), true);
+    for (int y = 0; y < box_height; ++y) {
+        mask_array(casacore::IPosition(2, 0, y)) = false;
+    }
+    casacore::ArrayLattice<casacore::Bool> mask(mask_array);
+    std::map<CARTA::StatsType, std::vector<double>> results;
+    float progress(0.0);
+    int calls(0);
+    while (progress < 1.0) {
+        ASSERT_TRUE(
+            loader->GetRegionSpectralData(1, AxisRange(0, ALL_Z), 0, mask, casacore::IPosition(2, x0, y0), mutex, results, progress));
+        ASSERT_LT(++calls, 100);
+    }
+    ASSERT_EQ(results[CARTA::StatsType::Mean].size(), depth);
+    for (int z = 0; z < depth; ++z) {
+        double sum(0.0), sum_sq(0.0), min_val(1e30), max_val(-1e30);
+        size_t n(0);
+        for (int y = 0; y < box_height; ++y) {
+            for (int x = 1; x < box_width; ++x) {
+                float v = box(casacore::IPosition(3, x, y, z));
+                if (std::isfinite(v)) {
+                    ++n;
+                    sum += v;
+                    sum_sq += static_cast<double>(v) * v;
+                    min_val = std::min<double>(min_val, v);
+                    max_val = std::max<double>(max_val, v);
+                }
+            }
+        }
+        ASSERT_GT(n, 0);
+        EXPECT_EQ(results[CARTA::StatsType::NumPixels][z], n) << "channel " << z;
+        EXPECT_NEAR(results[CARTA::StatsType::Sum][z], sum, 1e-3 * std::abs(sum)) << "channel " << z;
+        EXPECT_NEAR(results[CARTA::StatsType::Mean][z], sum / n, 1e-6 * std::abs(sum / n)) << "channel " << z;
+        EXPECT_NEAR(results[CARTA::StatsType::RMS][z], std::sqrt(sum_sq / n), 1e-6 * std::sqrt(sum_sq / n)) << "channel " << z;
+        EXPECT_DOUBLE_EQ(results[CARTA::StatsType::Min][z], min_val) << "channel " << z;
+        EXPECT_DOUBLE_EQ(results[CARTA::StatsType::Max][z], max_val) << "channel " << z;
+        EXPECT_TRUE(std::isfinite(results[CARTA::StatsType::FluxDensity][z])) << "channel " << z; // the cube has a beam
+    }
+
+    // A changed mask with the same bounding box is recomputed, not served from the first one
+    mask_array = true;
+    casacore::ArrayLattice<casacore::Bool> full_mask(mask_array);
+    std::map<CARTA::StatsType, std::vector<double>> full_results;
+    progress = 0.0;
+    while (progress < 1.0) {
+        ASSERT_TRUE(loader->GetRegionSpectralData(
+            1, AxisRange(0, ALL_Z), 0, full_mask, casacore::IPosition(2, x0, y0), mutex, full_results, progress));
+    }
+    EXPECT_GT(full_results[CARTA::StatsType::NumPixels][0], results[CARTA::StatsType::NumPixels][0]);
+
+    // The same through the region handler, as the spectral profiler does: a polygon box and a point
+    carta::RegionHandler region_handler;
+    int region_id(-1);
+    std::vector<CARTA::Point> corners = {Message::Point(x0 + 1, y0), Message::Point(x0 + box_width - 1, y0),
+        Message::Point(x0 + box_width - 1, y0 + box_height - 1), Message::Point(x0 + 1, y0 + box_height - 1)};
+    RegionState region_state(0, CARTA::POLYGON, corners, 0.0);
+    ASSERT_TRUE(region_handler.SetRegion(region_id, region_state, frame->CoordinateSystem()));
+    CARTA::SetSpectralRequirements requirements;
+    requirements.set_file_id(0);
+    requirements.set_region_id(region_id);
+    auto* profile_config = requirements.add_spectral_profiles();
+    profile_config->set_coordinate("z");
+    profile_config->add_stats_types(CARTA::StatsType::Mean);
+    profile_config->add_stats_types(CARTA::StatsType::NumPixels);
+    std::vector<CARTA::SetSpectralRequirements_SpectralConfig> configs = {
+        requirements.spectral_profiles().begin(), requirements.spectral_profiles().end()};
+    ASSERT_TRUE(region_handler.SetSpectralRequirements(region_id, 0, frame, configs));
+    CARTA::SpectralProfileData profile_data;
+    ASSERT_TRUE(region_handler.FillSpectralProfileData([&](CARTA::SpectralProfileData data) { profile_data = data; }, region_id, 0, false));
+    ASSERT_EQ(profile_data.progress(), 1.0);
+    ASSERT_EQ(profile_data.profiles_size(), 2);
+    auto mean_profile = GetSpectralProfileValues<double>(profile_data.profiles(0));
+    ASSERT_EQ(mean_profile.size(), depth);
+    for (int z = 0; z < depth; ++z) {
+        EXPECT_NEAR(mean_profile[z], results[CARTA::StatsType::Mean][z], 1e-6 * std::abs(mean_profile[z])) << "channel " << z;
     }
 }
 
@@ -724,11 +888,12 @@ TEST_F(HealpixTest, ExtendedMatchShowsTheMapAroundTheImage) {
     auto image = loader->GetImage();
     ASSERT_TRUE(image);
     auto shape = image->shape();
-    // 229 pixels of reach each side of the centre plus the centre itself, then rounded to keep the image on integer pixels
-    EXPECT_GE(shape(0), 2 * 229 - 2);
-    EXPECT_LE(shape(0), 2 * 229 + 2);
-    EXPECT_GE(shape(1), 2 * 229 - 2);
-    EXPECT_LE(shape(1), 2 * 229 + 2);
+    // 229 pixels of reach each side of the centre plus a pixel of margin and the centre itself, then rounded to keep
+    // the image on integer pixels
+    EXPECT_GE(shape(0), 2 * 229);
+    EXPECT_LE(shape(0), 2 * 229 + 4);
+    EXPECT_GE(shape(1), 2 * 229);
+    EXPECT_LE(shape(1), 2 * 229 + 4);
     EXPECT_EQ((shape(0) - 60) % 2, 0);
     EXPECT_EQ((shape(1) - 40) % 2, 0);
 

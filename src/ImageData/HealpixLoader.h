@@ -9,6 +9,7 @@
 #ifndef CARTA_SRC_IMAGEDATA_HEALPIXLOADER_H_
 #define CARTA_SRC_IMAGEDATA_HEALPIXLOADER_H_
 
+#include <map>
 #include <mutex>
 
 #include "CartaHealpixImage.h"
@@ -49,17 +50,41 @@ public:
     void LoadImageStats(bool load_percentiles = false) override;
     FileInfo::ImageStats& GetImageStats(int current_stokes, int z) override;
 
+    // Spectral profiles through a cube (one map per channel): the grid points of the cursor or region are converted
+    // to map pixels once, then read from every map, instead of reprojecting the region for each channel
+    bool GetCursorSpectralData(
+        std::vector<float>& data, int stokes, int cursor_x, int count_x, int cursor_y, int count_y, std::mutex& image_mutex) override;
+    bool UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& image_mutex) override;
+    bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes, const casacore::ArrayLattice<casacore::Bool>& mask,
+        const casacore::IPosition& origin, std::mutex& image_mutex, std::map<CARTA::StatsType, std::vector<double>>& results,
+        float& progress) override;
+
 private:
+    // Progress of a region's spectral profile, accumulated a band of rows at a time (all channels per band)
+    struct RegionSpectralProgress {
+        casacore::IPosition origin, shape;
+        size_t mask_signature = 0; // the region's mask, so that a reshaped region with the same bounding box is recomputed
+        int z_from = 0, z_to = 0;
+        size_t next_row = 0;
+        bool completed = false;
+        std::vector<uint64_t> num_pixels;
+        std::vector<double> sum, sum_sq, min, max;
+        std::map<CARTA::StatsType, std::vector<double>> stats;
+    };
+
     void AllocateImage(const std::string& hdu) override;
     unsigned int ResolveHdu(const std::string& hdu);
     CartaHealpixImage* HealpixImage() const;
     int MapIndex(int z, int stokes) const;
+    bool HasSpectralMaps() const;
     void ComputeMapStats(size_t map, FileInfo::ImageStats& stats) const;
 
     HealpixProjectionOptions _options;
     unsigned int _hdu_num;
     bool _options_changed;
     std::mutex _stats_mutex;
+    std::mutex _spectral_mutex;
+    std::map<FileInfo::RegionStatsId, RegionSpectralProgress> _region_spectral;
 };
 
 } // namespace carta

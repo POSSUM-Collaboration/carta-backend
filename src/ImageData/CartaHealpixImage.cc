@@ -52,7 +52,8 @@ namespace {
 const double PI = M_PI;
 const double DEG2RAD = M_PI / 180.0;
 const unsigned int CURSOR_SIZE = 512;
-const int MAX_EXTENDED_SIDE = 131072; // pixels per side when a matched grid is extended to show the map around an image
+// Most pixels per side of a grid: the tile coordinates of the image viewer index 4096 tiles of 256 pixels per axis
+const int MAX_GRID_SIDE = 1 << 20;
 
 std::string UpperTrim(std::string s) {
     s.erase(0, s.find_first_not_of(" \t'"));
@@ -99,23 +100,6 @@ casacore::Stokes::StokesTypes ColumnStokes(const std::string& column) {
     return casacore::Stokes::Undefined;
 }
 
-bool IsZenithal(casacore::Projection::Type type) {
-    switch (type) {
-        case casacore::Projection::AZP:
-        case casacore::Projection::SZP:
-        case casacore::Projection::TAN:
-        case casacore::Projection::SIN:
-        case casacore::Projection::STG:
-        case casacore::Projection::ARC:
-        case casacore::Projection::ZPN:
-        case casacore::Projection::ZEA:
-        case casacore::Projection::AIR:
-            return true;
-        default:
-            return false;
-    }
-}
-
 casacore::MDirection::Types FrameFromCode(const std::string& code, bool& ok) {
     ok = true;
     std::string c = UpperTrim(code);
@@ -154,15 +138,18 @@ namespace carta {
 
 /**
  * @brief Values of the maps of a HEALPix HDU, indexed by map (table column or image row) and HEALPix pixel.
- * FullMap returns a whole map as a contiguous array when one is available cheaply (held or cached in memory);
- * otherwise Value reads single pixels. Both must be safe to call from several threads at once.
+ * ReadRange reads a contiguous run of pixels of one map; ReadPixels reads an ascending list of pixels, as few
+ * reads as the source allows (a spectral profile reads the same pixels from every map, so this is the hot path
+ * when the file is on a slow or network file system). Both must be safe to call from several threads at once.
+ * Values are NaN where unseen or out of range.
  */
 class HealpixMapSource {
 public:
     virtual ~HealpixMapSource() = default;
     virtual size_t NumMaps() const = 0;
-    virtual std::shared_ptr<const std::vector<float>> FullMap(size_t map) = 0;
-    virtual float Value(size_t map, int64_t pix) = 0;
+    virtual size_t Npix() const = 0;
+    virtual void ReadRange(size_t map, int64_t first, size_t count, float* out) = 0;
+    virtual void ReadPixels(size_t map, const int64_t* pixels, size_t count, float* out) = 0;
 };
 
 namespace {
@@ -174,62 +161,137 @@ public:
     size_t NumMaps() const override {
         return _maps.size();
     }
-    std::shared_ptr<const std::vector<float>> FullMap(size_t map) override {
-        return map < _maps.size() ? _maps[map] : nullptr;
+    size_t Npix() const override {
+        return _maps.empty() ? 0 : _maps[0]->size();
     }
-    float Value(size_t map, int64_t pix) override {
-        if (map >= _maps.size() || pix < 0 || pix >= static_cast<int64_t>(_maps[map]->size())) {
-            return FLOAT_NAN;
+    void ReadRange(size_t map, int64_t first, size_t count, float* out) override {
+        if (map >= _maps.size()) {
+            std::fill(out, out + count, FLOAT_NAN);
+            return;
         }
-        return (*_maps[map])[pix];
+        const auto& values = *_maps[map];
+        for (size_t i = 0; i < count; ++i) {
+            int64_t pix = first + i;
+            out[i] = (pix >= 0 && pix < static_cast<int64_t>(values.size())) ? values[pix] : FLOAT_NAN;
+        }
+    }
+    void ReadPixels(size_t map, const int64_t* pixels, size_t count, float* out) override {
+        if (map >= _maps.size()) {
+            std::fill(out, out + count, FLOAT_NAN);
+            return;
+        }
+        const auto& values = *_maps[map];
+        for (size_t i = 0; i < count; ++i) {
+            int64_t pix = pixels[i];
+            out[i] = (pix >= 0 && pix < static_cast<int64_t>(values.size())) ? values[pix] : FLOAT_NAN;
+        }
     }
 
 private:
     std::vector<std::shared_ptr<std::vector<float>>> _maps;
 };
 
-// Image-format maps read directly from a memory-mapped uncompressed FITS file (BITPIX -32 or -64, big-endian)
+// Image-format maps read directly from an uncompressed FITS file (BITPIX -32 or -64, big-endian) with pread:
+// explicit reads of the byte ranges needed, rather than page faults on a memory mapping, so that a file on a
+// network or virtualised file system (a Docker or container volume) is read in a few requests per map
 class MappedImageMapSource : public HealpixMapSource {
 public:
     MappedImageMapSource(
         const std::string& filename, long long data_offset, int bitpix, long npix, long num_maps, double bscale, double bzero, float bad)
-        : _npix(npix), _num_maps(num_maps), _bytes(std::abs(bitpix) / 8), _bscale(bscale), _bzero(bzero), _bad(bad) {
-        int fd = open(filename.c_str(), O_RDONLY);
-        if (fd < 0) {
-            throw(casacore::AipsError("Cannot open HEALPix file for mapping."));
+        : _npix(npix),
+          _num_maps(num_maps),
+          _bytes(std::abs(bitpix) / 8),
+          _data_offset(data_offset),
+          _bscale(bscale),
+          _bzero(bzero),
+          _bad(bad) {
+        _fd = open(filename.c_str(), O_RDONLY);
+        if (_fd < 0) {
+            throw(casacore::AipsError("Cannot open HEALPix file for reading."));
         }
         struct stat st;
-        if (fstat(fd, &st) != 0 || st.st_size < data_offset + static_cast<long long>(_bytes) * npix * num_maps) {
-            close(fd);
+        if (fstat(_fd, &st) != 0 || st.st_size < data_offset + static_cast<long long>(_bytes) * npix * num_maps) {
+            close(_fd);
             throw(casacore::AipsError("HEALPix file is shorter than its header describes."));
         }
-        _length = st.st_size;
-        void* base = mmap(nullptr, _length, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (base == MAP_FAILED) {
-            throw(casacore::AipsError("Cannot memory-map HEALPix file."));
-        }
-        _base = static_cast<const char*>(base);
-        _data = _base + data_offset;
         const uint16_t one(1);
         _swap = (*reinterpret_cast<const uint8_t*>(&one) == 1); // little-endian host, FITS data is big-endian
     }
     ~MappedImageMapSource() override {
-        if (_base) {
-            munmap(const_cast<char*>(_base), _length);
+        if (_fd >= 0) {
+            close(_fd);
         }
     }
     size_t NumMaps() const override {
         return _num_maps;
     }
-    std::shared_ptr<const std::vector<float>> FullMap(size_t) override {
-        return nullptr; // read per pixel from the mapping
+    size_t Npix() const override {
+        return _npix;
     }
-    float Value(size_t map, int64_t pix) override {
-        if (map >= static_cast<size_t>(_num_maps) || pix < 0 || pix >= _npix) {
-            return FLOAT_NAN;
+    void ReadRange(size_t map, int64_t first, size_t count, float* out) override {
+        if (map >= static_cast<size_t>(_num_maps) || first < 0 || first + static_cast<int64_t>(count) > _npix) {
+            std::fill(out, out + count, FLOAT_NAN);
+            return;
         }
-        const char* p = _data + (static_cast<int64_t>(map) * _npix + pix) * _bytes;
+        std::vector<char> raw(count * _bytes);
+        if (!ReadBytes(map, first, raw)) {
+            std::fill(out, out + count, FLOAT_NAN);
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = Decode(raw.data() + i * _bytes);
+        }
+    }
+    void ReadPixels(size_t map, const int64_t* pixels, size_t count, float* out) override {
+        // Pixels are ascending: read them in runs, starting a new run where the gap would cost more than a
+        // small read or the run's buffer would get large; each run is one pread of a contiguous byte range
+        const int64_t max_gap(2048);
+        const int64_t max_run = (4 << 20) / _bytes;
+        std::vector<char> raw;
+        size_t start(0);
+        while (start < count) {
+            size_t end(start + 1);
+            while (end < count && pixels[end] - pixels[end - 1] <= max_gap && pixels[end] - pixels[start] < max_run) {
+                ++end;
+            }
+            if (map >= static_cast<size_t>(_num_maps) || pixels[start] < 0 || pixels[end - 1] >= _npix) {
+                for (size_t i = start; i < end; ++i) {
+                    out[i] =
+                        (pixels[i] >= 0 && pixels[i] < _npix && map < static_cast<size_t>(_num_maps)) ? ReadOne(map, pixels[i]) : FLOAT_NAN;
+                }
+            } else {
+                const size_t run = pixels[end - 1] - pixels[start] + 1;
+                raw.resize(run * _bytes);
+                if (ReadBytes(map, pixels[start], raw)) {
+                    for (size_t i = start; i < end; ++i) {
+                        out[i] = Decode(raw.data() + (pixels[i] - pixels[start]) * _bytes);
+                    }
+                } else {
+                    std::fill(out + start, out + end, FLOAT_NAN);
+                }
+            }
+            start = end;
+        }
+    }
+
+private:
+    bool ReadBytes(size_t map, int64_t first, std::vector<char>& raw) const {
+        off_t offset = _data_offset + (static_cast<int64_t>(map) * _npix + first) * _bytes;
+        size_t done(0);
+        while (done < raw.size()) {
+            ssize_t n = pread(_fd, raw.data() + done, raw.size() - done, offset + done);
+            if (n <= 0) {
+                return false;
+            }
+            done += n;
+        }
+        return true;
+    }
+    float ReadOne(size_t map, int64_t pix) const {
+        std::vector<char> raw(_bytes);
+        return ReadBytes(map, pix, raw) ? Decode(raw.data()) : FLOAT_NAN;
+    }
+    float Decode(const char* p) const {
         double v;
         if (_bytes == 4) {
             uint32_t u;
@@ -254,15 +316,13 @@ public:
         return IsBadValue(value, _bad) ? FLOAT_NAN : value;
     }
 
-private:
     long _npix;
     long _num_maps;
     int _bytes;
+    long long _data_offset;
     double _bscale, _bzero;
     float _bad;
-    const char* _base = nullptr;
-    const char* _data = nullptr;
-    size_t _length = 0;
+    int _fd = -1;
     bool _swap = true;
 };
 
@@ -280,7 +340,26 @@ public:
     size_t NumMaps() const override {
         return _num_maps;
     }
-    std::shared_ptr<const std::vector<float>> FullMap(size_t map) override {
+    size_t Npix() const override {
+        return _npix;
+    }
+    void ReadRange(size_t map, int64_t first, size_t count, float* out) override {
+        auto values = FullMap(map);
+        for (size_t i = 0; i < count; ++i) {
+            int64_t pix = first + i;
+            out[i] = (values && pix >= 0 && pix < static_cast<int64_t>(values->size())) ? (*values)[pix] : FLOAT_NAN;
+        }
+    }
+    void ReadPixels(size_t map, const int64_t* pixels, size_t count, float* out) override {
+        auto values = FullMap(map);
+        for (size_t i = 0; i < count; ++i) {
+            int64_t pix = pixels[i];
+            out[i] = (values && pix >= 0 && pix < static_cast<int64_t>(values->size())) ? (*values)[pix] : FLOAT_NAN;
+        }
+    }
+
+private:
+    std::shared_ptr<const std::vector<float>> FullMap(size_t map) {
         if (map >= static_cast<size_t>(_num_maps)) {
             return nullptr;
         }
@@ -320,15 +399,7 @@ public:
         }
         return values;
     }
-    float Value(size_t map, int64_t pix) override {
-        auto values = FullMap(map);
-        if (!values || pix < 0 || pix >= static_cast<int64_t>(values->size())) {
-            return FLOAT_NAN;
-        }
-        return (*values)[pix];
-    }
 
-private:
     static constexpr size_t MAX_CACHED_MAPS = 8;
     std::string _filename;
     unsigned int _hdu;
@@ -806,7 +877,7 @@ void CartaHealpixImage::SetUpCoordinateSystem() {
         int new_height = _options.height > 0 ? _options.height : height;
         if (_options.extend_sky && _options.width <= 0 && _options.height <= 0) {
             // Show the map around the image: enlarge the grid, centred on the image, out to where the projection stops
-            // being valid (a hemisphere for SIN, the cap for TAN or all-sky projections) at the image's pixel scale
+            // being valid (the hemisphere of a SIN image, the whole sphere of a ZEA image) at the image's pixel scale
             auto extent = ExtendedGridSize(matched.directionCoordinate(), width, height);
             new_width = extent.first;
             new_height = extent.second;
@@ -840,15 +911,29 @@ void CartaHealpixImage::SetUpCoordinateSystem() {
 
         double scale =
             std::isnan(_options.pixel_scale_deg) || _options.pixel_scale_deg <= 0 ? _info.resolution_deg() : _options.pixel_scale_deg;
-        bool zenithal = IsZenithal(proj_type);
-        width = _options.width > 0 ? _options.width : static_cast<int>(std::ceil((zenithal ? 90.0 : 360.0) / scale));
-        height = _options.height > 0 ? _options.height : static_cast<int>(std::ceil((zenithal ? 90.0 : 180.0) / scale));
-
         double lon0 = std::isnan(_options.center_lon_deg) ? 0.0 : _options.center_lon_deg;
         double lat0 = std::isnan(_options.center_lat_deg) ? 0.0 : _options.center_lat_deg;
 
         casacore::Matrix<double> xform(2, 2, 0.0);
         xform.diagonal() = 1.0;
+
+        // Grid size: as far as the projection reaches from its reference point along each axis (the whole ellipse of
+        // a Mollweide or Aitoff map, the full hemisphere of a SIN map, the whole sphere of a ZEA map), plus one pixel
+        // of margin, with the reference pixel at the centre; never more than 360 degrees across
+        width = _options.width;
+        height = _options.height;
+        if (width <= 0 || height <= 0) {
+            const int max_half = std::min(MAX_GRID_SIDE / 2, static_cast<int>(std::ceil(180.0 / scale)));
+            casacore::DirectionCoordinate probe(_grid_frame, casacore::Projection(proj_type), lon0 * DEG2RAD, lat0 * DEG2RAD,
+                -scale * DEG2RAD, scale * DEG2RAD, xform, 0.0, 0.0);
+            auto reach = ValidReach(probe, 0.0, 0.0, max_half);
+            if (width <= 0) {
+                width = 2 * (reach.first + 1) + 1;
+            }
+            if (height <= 0) {
+                height = 2 * (reach.second + 1) + 1;
+            }
+        }
         // Reference pixel at the image centre (0-based), longitude increasing to the left
         _direction_coord = casacore::DirectionCoordinate(_grid_frame, casacore::Projection(proj_type), lon0 * DEG2RAD, lat0 * DEG2RAD,
             -scale * DEG2RAD, scale * DEG2RAD, xform, (width - 1) / 2.0, (height - 1) / 2.0);
@@ -951,26 +1036,22 @@ bool CartaHealpixImage::AddMapAxisCoordinate(casacore::CoordinateSystem& coord_s
     return true;
 }
 
-std::pair<int, int> CartaHealpixImage::ExtendedGridSize(const casacore::DirectionCoordinate& direction, int width, int height) {
-    // Largest distance (in pixels) from the image centre along each grid axis at which pixels still convert to a sky
-    // position less than 90 degrees from the reference direction, found by bisection; capped per side.
-    const int max_half(MAX_EXTENDED_SIDE / 2);
-    const double cx = (width - 1) / 2.0, cy = (height - 1) / 2.0;
-    casacore::Vector<casacore::Double> ref = direction.referenceValue();
-    auto units = direction.worldAxisUnits();
-    const double lon_factor = casacore::Quantity(1.0, units(0)).getValue("rad");
-    const double lat_factor = casacore::Quantity(1.0, units(1)).getValue("rad");
-    casacore::MVDirection reference(ref(0) * lon_factor, ref(1) * lat_factor);
-
+std::pair<int, int> CartaHealpixImage::ValidReach(const casacore::DirectionCoordinate& direction, double cx, double cy, int max_half) {
+    // Largest number of pixels from (cx, cy) along each grid axis at which the projection is still valid: the pixel
+    // converts to a sky position, and that position converts back to the same pixel (a plate carree grid, say,
+    // converts pixels beyond 180 degrees of longitude to positions that belong to pixels on its other side).
+    // Found by bisection, so at most max_half.
     auto on_sky = [&](double x, double y) {
-        casacore::Vector<casacore::Double> pixel(2), world(2);
+        casacore::Vector<casacore::Double> pixel(2), world(2), back(2);
         pixel(0) = x;
         pixel(1) = y;
         if (!direction.toWorld(world, pixel) || !std::isfinite(world(0)) || !std::isfinite(world(1))) {
             return false;
         }
-        casacore::MVDirection position(world(0) * lon_factor, world(1) * lat_factor);
-        return reference.separation(position) < PI / 2.0 - 1.0e-6;
+        if (!direction.toPixel(back, world) || !std::isfinite(back(0)) || !std::isfinite(back(1))) {
+            return false;
+        }
+        return std::abs(back(0) - x) < 0.5 && std::abs(back(1) - y) < 0.5;
     };
     auto reach = [&](double sx, double sy) { // along the direction (sx, sy) from the centre
         int lo(0), hi(max_half);
@@ -984,17 +1065,23 @@ std::pair<int, int> CartaHealpixImage::ExtendedGridSize(const casacore::Directio
         }
         return lo;
     };
+    return {std::max(reach(1, 0), reach(-1, 0)), std::max(reach(0, 1), reach(0, -1))};
+}
 
-    int half_x = std::max(reach(1, 0), reach(-1, 0));
-    int half_y = std::max(reach(0, 1), reach(0, -1));
-    int new_width = std::max(width, std::min(MAX_EXTENDED_SIDE, 2 * half_x + 1));
-    int new_height = std::max(height, std::min(MAX_EXTENDED_SIDE, 2 * half_y + 1));
+std::pair<int, int> CartaHealpixImage::ExtendedGridSize(const casacore::DirectionCoordinate& direction, int width, int height) {
+    // The grid, centred on the image, enlarged to everywhere the image's projection is valid (the hemisphere of a
+    // SIN image, the whole sphere of a ZEA image, as far as the cap allows for a TAN image): all the sky the map
+    // can show around the image, at the image's pixel scale
+    const double cx = (width - 1) / 2.0, cy = (height - 1) / 2.0;
+    auto reach = ValidReach(direction, cx, cy, MAX_GRID_SIDE / 2);
+    int new_width = std::max(width, std::min(MAX_GRID_SIDE, 2 * (reach.first + 1) + 1));
+    int new_height = std::max(height, std::min(MAX_GRID_SIDE, 2 * (reach.second + 1) + 1));
     // Keep the image's pixels on the new grid's integer positions: the offset (new - old) / 2 must be a whole number
     if ((new_width - width) % 2) {
-        new_width = (new_width < MAX_EXTENDED_SIDE) ? new_width + 1 : new_width - 1;
+        new_width = (new_width < MAX_GRID_SIDE) ? new_width + 1 : new_width - 1;
     }
     if ((new_height - height) % 2) {
-        new_height = (new_height < MAX_EXTENDED_SIDE) ? new_height + 1 : new_height - 1;
+        new_height = (new_height < MAX_GRID_SIDE) ? new_height + 1 : new_height - 1;
     }
     return {new_width, new_height};
 }
@@ -1132,6 +1219,46 @@ void CartaHealpixImage::Sample(double x0, double dx, size_t nx, double y0, doubl
         return;
     }
 
+    // The points are processed in chunks, in parallel, so that a full-resolution plane of a large grid (tens of
+    // millions of pixels when matched to a survey image) never needs its coordinates held in memory at once.
+    const size_t chunk_size(1 << 16);
+    const size_t num_chunks = (npoints + chunk_size - 1) / chunk_size;
+
+#pragma omp parallel for schedule(dynamic)
+    for (size_t chunk = 0; chunk < num_chunks; ++chunk) {
+        const size_t chunk_start = chunk * chunk_size;
+        const size_t nchunk = std::min(chunk_size, npoints - chunk_start);
+
+        // Grid pixel coordinates (0-based) of the chunk's points, x fastest
+        std::vector<double> x(nchunk), y(nchunk);
+        for (size_t k = 0; k < nchunk; ++k) {
+            const size_t p = chunk_start + k;
+            x[k] = x0 + (p % nx) * dx;
+            y[k] = y0 + (p / nx) * dy;
+        }
+
+        HealpixLookupPlan plan;
+        PlanLookup(x.data(), y.data(), nchunk, plan);
+        for (size_t c = 0; c < ncol; ++c) {
+            LookupPlanned(plan, column0 + c * column_stride, data + c * npoints + chunk_start);
+        }
+    }
+}
+
+size_t CartaHealpixImage::Npix() const {
+    return _info.npix();
+}
+
+void CartaHealpixImage::ReadMapRange(size_t map, int64_t first, size_t count, float* out) const {
+    if (!_source || map >= _source->NumMaps()) {
+        std::fill(out, out + count, FLOAT_NAN);
+        return;
+    }
+    _source->ReadRange(map, first, count, out);
+}
+
+void CartaHealpixImage::ToMapDirections(
+    const double* x, const double* y, size_t npoints, std::vector<double>& lon, std::vector<double>& lat, std::vector<bool>& valid) const {
     // The direction coordinate's own pixel-axis order (the image may have latitude as its first axis when matched)
     const auto& coord_sys = coordinates();
     const int dir_coord = coord_sys.directionCoordinateNumber();
@@ -1145,121 +1272,93 @@ void CartaHealpixImage::Sample(double x0, double dx, size_t nx, double y0, doubl
     const double lat_factor = casacore::Quantity(1.0, units(1)).getValue("rad");
     const double max_lat = PI / 2.0 + 1.0e-9;
 
-    // The points are processed in chunks, in parallel, so that a full-resolution plane of a large grid (tens of
-    // millions of pixels when matched to a survey image) never needs its coordinates held in memory at once.
-    // Each chunk converts with its own copy of the direction coordinate (casacore's is not thread-safe).
-    const size_t chunk_size(1 << 16);
-    const size_t block_size(4096); // casacore's DirectionCoordinate::toWorldMany returns garbage for the points after
-                                   // the first off-sky pixel of a batch, so any block with a failure is redone point by point
-    const size_t num_chunks = (npoints + chunk_size - 1) / chunk_size;
+    // Each call converts with its own copy of the direction coordinate (casacore's is not thread-safe)
+    casacore::DirectionCoordinate direction_copy(direction);
+    casacore::Matrix<casacore::Double> pixel(2, npoints, 0.0);
+    for (size_t k = 0; k < npoints; ++k) {
+        pixel(lon_row, k) = x[k];
+        pixel(lat_row, k) = y[k];
+    }
+    lon.assign(npoints, 0.0);
+    lat.assign(npoints, 0.0);
+    valid.assign(npoints, false);
 
-#pragma omp parallel for schedule(dynamic)
-    for (size_t chunk = 0; chunk < num_chunks; ++chunk) {
-        const size_t chunk_start = chunk * chunk_size;
-        const size_t nchunk = std::min(chunk_size, npoints - chunk_start);
-        casacore::DirectionCoordinate direction_copy(direction);
-        casacore::Matrix<casacore::Double> pixel(2, nchunk, 0.0);
-        std::vector<double> lon(nchunk), lat(nchunk);
-        std::vector<bool> valid(nchunk, false);
-        casacore::Vector<casacore::Double> one_pixel(2), one_world(2);
+    // Convert to world (radians), in blocks: casacore's DirectionCoordinate::toWorldMany returns garbage for the
+    // points after the first off-sky pixel of a batch, so any block with a failure is redone point by point
+    const size_t block_size(4096);
+    casacore::Vector<casacore::Double> one_pixel(2), one_world(2);
+    for (size_t block_start = 0; block_start < npoints; block_start += block_size) {
+        const size_t n = std::min(npoints, block_start + block_size) - block_start;
+        casacore::Matrix<casacore::Double> block_pixel = pixel(casacore::Slice(0, 2), casacore::Slice(block_start, n));
+        casacore::Matrix<casacore::Double> world;
+        casacore::Vector<casacore::Bool> failures;
 
-        // Grid pixel coordinates (0-based) of the chunk's points, x fastest
-        for (size_t k = 0; k < nchunk; ++k) {
-            const size_t p = chunk_start + k;
-            pixel(lon_row, k) = x0 + (p % nx) * dx;
-            pixel(lat_row, k) = y0 + (p / nx) * dy;
-        }
-
-        // Convert to world (radians)
-        for (size_t block_start = 0; block_start < nchunk; block_start += block_size) {
-            const size_t n = std::min(nchunk, block_start + block_size) - block_start;
-            casacore::Matrix<casacore::Double> block_pixel = pixel(casacore::Slice(0, 2), casacore::Slice(block_start, n));
-            casacore::Matrix<casacore::Double> world;
-            casacore::Vector<casacore::Bool> failures;
-
-            if (direction_copy.toWorldMany(world, block_pixel, failures)) {
-                for (size_t i = 0; i < n; ++i) {
-                    lon[block_start + i] = world(0, i) * lon_factor;
-                    lat[block_start + i] = world(1, i) * lat_factor;
+        if (direction_copy.toWorldMany(world, block_pixel, failures)) {
+            for (size_t i = 0; i < n; ++i) {
+                lon[block_start + i] = world(0, i) * lon_factor;
+                lat[block_start + i] = world(1, i) * lat_factor;
+                valid[block_start + i] = true;
+            }
+        } else {
+            for (size_t i = 0; i < n; ++i) {
+                one_pixel(0) = block_pixel(0, i);
+                one_pixel(1) = block_pixel(1, i);
+                if (direction_copy.toWorld(one_world, one_pixel)) {
+                    lon[block_start + i] = one_world(0) * lon_factor;
+                    lat[block_start + i] = one_world(1) * lat_factor;
                     valid[block_start + i] = true;
-                }
-            } else {
-                for (size_t i = 0; i < n; ++i) {
-                    one_pixel(0) = block_pixel(0, i);
-                    one_pixel(1) = block_pixel(1, i);
-                    if (direction_copy.toWorld(one_world, one_pixel)) {
-                        lon[block_start + i] = one_world(0) * lon_factor;
-                        lat[block_start + i] = one_world(1) * lat_factor;
-                        valid[block_start + i] = true;
-                    }
                 }
             }
         }
+    }
 
-        for (size_t k = 0; k < nchunk; ++k) {
+    for (size_t k = 0; k < npoints; ++k) {
+        if (!valid[k]) {
+            continue;
+        }
+        if (!std::isfinite(lon[k]) || !std::isfinite(lat[k]) || std::abs(lat[k]) > max_lat) {
+            valid[k] = false;
+        } else {
+            lat[k] = std::max(-PI / 2.0, std::min(PI / 2.0, lat[k]));
+        }
+    }
+
+    if (_needs_rotation) {
+        for (size_t k = 0; k < npoints; ++k) {
             if (!valid[k]) {
                 continue;
             }
-            if (!std::isfinite(lon[k]) || !std::isfinite(lat[k]) || std::abs(lat[k]) > max_lat) {
-                valid[k] = false;
-            } else {
-                lat[k] = std::max(-PI / 2.0, std::min(PI / 2.0, lat[k]));
-            }
-        }
-
-        if (_needs_rotation) {
-            for (size_t k = 0; k < nchunk; ++k) {
-                if (!valid[k]) {
-                    continue;
-                }
-                double cl = std::cos(lat[k]);
-                double v0 = cl * std::cos(lon[k]), v1 = cl * std::sin(lon[k]), v2 = std::sin(lat[k]);
-                double r0 = _rotation(0, 0) * v0 + _rotation(0, 1) * v1 + _rotation(0, 2) * v2;
-                double r1 = _rotation(1, 0) * v0 + _rotation(1, 1) * v1 + _rotation(1, 2) * v2;
-                double r2 = _rotation(2, 0) * v0 + _rotation(2, 1) * v1 + _rotation(2, 2) * v2;
-                lon[k] = std::atan2(r1, r0);
-                lat[k] = std::asin(std::max(-1.0, std::min(1.0, r2)));
-            }
-        }
-
-        for (size_t c = 0; c < ncol; ++c) {
-            Lookup(lon.data(), lat.data(), valid, nchunk, column0 + c * column_stride, data + c * npoints + chunk_start);
+            double cl = std::cos(lat[k]);
+            double v0 = cl * std::cos(lon[k]), v1 = cl * std::sin(lon[k]), v2 = std::sin(lat[k]);
+            double r0 = _rotation(0, 0) * v0 + _rotation(0, 1) * v1 + _rotation(0, 2) * v2;
+            double r1 = _rotation(1, 0) * v0 + _rotation(1, 1) * v1 + _rotation(1, 2) * v2;
+            double r2 = _rotation(2, 0) * v0 + _rotation(2, 1) * v1 + _rotation(2, 2) * v2;
+            lon[k] = std::atan2(r1, r0);
+            lat[k] = std::asin(std::max(-1.0, std::min(1.0, r2)));
         }
     }
 }
 
-size_t CartaHealpixImage::Npix() const {
-    return _info.npix();
-}
+void CartaHealpixImage::PlanLookup(const double* x, const double* y, size_t npoints, HealpixLookupPlan& plan) const {
+    std::vector<double> lon, lat;
+    std::vector<bool> valid;
+    ToMapDirections(x, y, npoints, lon, lat, valid);
 
-std::shared_ptr<const std::vector<float>> CartaHealpixImage::MapValues(size_t map) const {
-    return _source ? _source->FullMap(map) : nullptr;
-}
-
-float CartaHealpixImage::MapValue(size_t map, int64_t pix) const {
-    return _source ? _source->Value(map, pix) : FLOAT_NAN;
-}
-
-void CartaHealpixImage::Lookup(
-    const double* lon, const double* lat, const std::vector<bool>& valid, size_t npoints, size_t column, float* out) const {
-    if (!_source || column >= _source->NumMaps()) {
-        std::fill(out, out + npoints, FLOAT_NAN);
-        return;
+    plan.npoints = npoints;
+    plan.bilinear = _options.bilinear;
+    const size_t neighbours = plan.neighbours();
+    plan.point_pixels.assign(npoints * neighbours, -1);
+    plan.point_weights.clear();
+    if (plan.bilinear) {
+        plan.point_weights.assign(npoints * 4, 0.0f);
     }
-    // A whole map in memory when the source has one; otherwise single-pixel reads from the source
-    std::shared_ptr<const std::vector<float>> held = _source->FullMap(column);
-    const float* map = held ? held->data() : nullptr;
-    const int64_t npix = _info.npix();
-    auto value_at = [&](int64_t pix) -> float {
-        if (map) {
-            return (pix >= 0 && pix < npix) ? map[pix] : FLOAT_NAN;
-        }
-        return _source->Value(column, pix);
-    };
+    plan.pixels.clear();
 
+    // HEALPix pixel (or 4 neighbours and weights) of every point on the sky
+    std::vector<int64_t> wanted;
+    wanted.reserve(npoints * neighbours);
     for (size_t p = 0; p < npoints; ++p) {
         if (!valid[p]) {
-            out[p] = FLOAT_NAN;
             continue;
         }
         double theta = PI / 2.0 - lat[p];
@@ -1268,22 +1367,63 @@ void CartaHealpixImage::Lookup(
             phi += 2.0 * PI;
         }
         pointing ptg(theta, phi);
-
-        if (_options.bilinear) {
+        if (plan.bilinear) {
             fix_arr<int64_t, 4> pix;
             fix_arr<double, 4> wgt;
             _healpix->get_interpol(ptg, pix, wgt);
+            for (int n = 0; n < 4; ++n) {
+                wanted.push_back(pix[n]);
+                plan.point_weights[p * 4 + n] = static_cast<float>(wgt[n]);
+            }
+        } else {
+            wanted.push_back(_healpix->ang2pix(ptg));
+        }
+    }
+
+    // Distinct pixels, ascending, and each point's indices into them
+    plan.pixels = wanted;
+    std::sort(plan.pixels.begin(), plan.pixels.end());
+    plan.pixels.erase(std::unique(plan.pixels.begin(), plan.pixels.end()), plan.pixels.end());
+    size_t next(0);
+    for (size_t p = 0; p < npoints; ++p) {
+        if (!valid[p]) {
+            continue;
+        }
+        for (size_t n = 0; n < neighbours; ++n) {
+            auto found = std::lower_bound(plan.pixels.begin(), plan.pixels.end(), wanted[next++]);
+            plan.point_pixels[p * neighbours + n] = static_cast<int32_t>(found - plan.pixels.begin());
+        }
+    }
+}
+
+void CartaHealpixImage::LookupPlanned(const HealpixLookupPlan& plan, size_t map, float* out) const {
+    if (!_source || map >= _source->NumMaps() || plan.pixels.empty()) {
+        std::fill(out, out + plan.npoints, FLOAT_NAN);
+        return;
+    }
+    std::vector<float> values(plan.pixels.size());
+    _source->ReadPixels(map, plan.pixels.data(), plan.pixels.size(), values.data());
+
+    if (plan.bilinear) {
+        for (size_t p = 0; p < plan.npoints; ++p) {
+            if (plan.point_pixels[p * 4] < 0) {
+                out[p] = FLOAT_NAN;
+                continue;
+            }
             double sum(0.0), wsum(0.0);
             for (int n = 0; n < 4; ++n) {
-                float v = value_at(pix[n]);
+                float v = values[plan.point_pixels[p * 4 + n]];
                 if (std::isfinite(v)) {
-                    sum += wgt[n] * v;
-                    wsum += wgt[n];
+                    sum += plan.point_weights[p * 4 + n] * v;
+                    wsum += plan.point_weights[p * 4 + n];
                 }
             }
             out[p] = wsum > 0.0 ? static_cast<float>(sum / wsum) : FLOAT_NAN;
-        } else {
-            out[p] = value_at(_healpix->ang2pix(ptg));
+        }
+    } else {
+        for (size_t p = 0; p < plan.npoints; ++p) {
+            int32_t index = plan.point_pixels[p];
+            out[p] = index < 0 ? FLOAT_NAN : values[index];
         }
     }
 }

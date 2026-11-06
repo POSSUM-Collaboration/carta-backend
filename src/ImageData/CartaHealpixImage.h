@@ -88,6 +88,22 @@ struct HealpixProjectionOptions {
 };
 
 /**
+ * @brief Where a set of grid points fall on a HEALPix map, worked out once so that the same points can be read from
+ * many maps (a spectral profile through a cube, one map per channel) without converting their coordinates again.
+ */
+struct HealpixLookupPlan {
+    std::vector<int64_t> pixels;       ///< distinct HEALPix pixels needed, ascending
+    std::vector<int32_t> point_pixels; ///< per point, its pixel's index into pixels (1 per point, or 4 when bilinear); -1 = off the sky
+    std::vector<float> point_weights;  ///< per point, the 4 interpolation weights (bilinear only)
+    size_t npoints = 0;
+    bool bilinear = false;
+
+    size_t neighbours() const {
+        return bilinear ? 4 : 1;
+    }
+};
+
+/**
  * @brief Read-only casacore image backed by a HEALPix map (a table held in memory, or an image HDU read lazily).
  *
  * Shape is [width, height] for a single map, or [width, height, nmaps] with a Stokes axis (when the table columns
@@ -137,10 +153,8 @@ public:
     size_t NumMaps() const;
     /// HEALPix pixels per map
     size_t Npix() const;
-    /// A whole map's values when the source holds one in memory (NaN where unseen), else null
-    std::shared_ptr<const std::vector<float>> MapValues(size_t map) const;
-    /// One HEALPix pixel of a map (NaN where unseen or out of range)
-    float MapValue(size_t map, int64_t pix) const;
+    /// A contiguous run of a map's own pixels (NaN where unseen or out of range). Thread-safe.
+    void ReadMapRange(size_t map, int64_t first, size_t count, float* out) const;
     /**
      * @brief Map values at a regular set of grid positions: x0 + i dx (i < nx), y0 + j dy (j < ny) in 0-based grid
      * pixels (fractional positions allowed, e.g. block centres for a downsampled tile), for the maps
@@ -148,15 +162,21 @@ public:
      */
     void Sample(double x0, double dx, size_t nx, double y0, double dy, size_t ny, size_t column0, size_t column_stride, size_t ncol,
         float* data) const;
+    /// Works out which map pixels the given grid points (0-based pixel coordinates) read, once for any number of maps. Thread-safe.
+    void PlanLookup(const double* x, const double* y, size_t npoints, HealpixLookupPlan& plan) const;
+    /// Values of one map at a plan's points (NaN off the sky or where unseen); out has plan.npoints entries. Thread-safe.
+    void LookupPlanned(const HealpixLookupPlan& plan, size_t map, float* out) const;
 
 private:
     void ReadMap();
     void ReadImageFormatMaps();
     void SetUpCoordinateSystem();
     bool AddMapAxisCoordinate(casacore::CoordinateSystem& coord_sys);
+    static std::pair<int, int> ValidReach(const casacore::DirectionCoordinate& direction, double cx, double cy, int max_half);
     static std::pair<int, int> ExtendedGridSize(const casacore::DirectionCoordinate& direction, int width, int height);
     void SetUpFrameRotation();
-    void Lookup(const double* lon, const double* lat, const std::vector<bool>& valid, size_t npoints, size_t column, float* out) const;
+    void ToMapDirections(const double* x, const double* y, size_t npoints, std::vector<double>& lon, std::vector<double>& lat,
+        std::vector<bool>& valid) const;
 
     std::string _filename;
     unsigned int _hdu;
