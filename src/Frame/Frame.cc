@@ -96,6 +96,10 @@ Frame::Frame(uint32_t session_id, std::shared_ptr<FileLoader> loader, const std:
         int tiles_x = (_dims.width - 1) / TILE_SIZE + 1;
         int tiles_y = (_dims.height - 1) / TILE_SIZE + 1;
         int tile_cache_capacity = std::min(MAX_TILE_CACHE_CAPACITY, 2 * (tiles_x + tiles_y));
+        if (_loader->HasMip(1)) {
+            // Pixels computed on demand: tiles are quick to make again, and the grid may be far larger than any image
+            tile_cache_capacity = std::min(tile_cache_capacity, MAX_ON_DEMAND_TILE_CACHE_CAPACITY);
+        }
         _tile_cache.Reset(_z_index, _stokes_index, tile_cache_capacity);
     }
 
@@ -1145,6 +1149,11 @@ void Frame::SetSpatialRequirements(const std::vector<CARTA::SetSpatialRequiremen
 }
 
 bool Frame::FillSpatialProfileData(std::vector<CARTA::SpatialProfileData>& spatial_profile_messages) {
+    // Cursor profiles: as an active task, so that the frame is not deleted (file closed or re-opened) while they are made
+    std::shared_lock lock(GetActiveTaskMutex());
+    if (!IsConnected()) {
+        return false;
+    }
     return FillSpatialProfileData(_cursor, _cursor_spatial_configs, spatial_profile_messages);
 }
 
@@ -1170,6 +1179,10 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
     int x, y;
     point.ToIndex(x, y); // convert float to index into image array
 
+    // A loader that computes pixels on demand at any resolution, full resolution included (a HEALPix map reprojected
+    // on the fly), gives single pixels, rows and columns directly: cheaper than loading every tile they cross
+    const bool pixels_on_demand = _use_tile_cache && _loader->HasMip(1) && !Stokes::IsComputed(CurrentStokes());
+
     float cursor_value_with_current_stokes(0.0);
 
     // Get the cursor value with current stokes
@@ -1179,11 +1192,27 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
         cursor_value_with_current_stokes = _image_cache[(y * _dims.width) + x];
         cache_lock.release();
     } else if (_use_tile_cache) {
-        int tile_x = tile_index(x);
-        int tile_y = tile_index(y);
-        auto tile = _tile_cache.Get(TileCache::Key(tile_x, tile_y), _loader, _image_mutex);
-        auto tile_width = tile_size(tile_x, _dims.width);
-        cursor_value_with_current_stokes = (*tile)[((y - tile_y) * tile_width) + (x - tile_x)];
+        bool have_value(false);
+        if (pixels_on_demand) {
+            // One pixel from the loader, rather than the chunk of tiles around it
+            CARTA::ImageBounds pixel_bounds;
+            pixel_bounds.set_x_min(x);
+            pixel_bounds.set_x_max(x + 1);
+            pixel_bounds.set_y_min(y);
+            pixel_bounds.set_y_max(y + 1);
+            std::vector<float> pixel;
+            if (_loader->GetDownsampledRasterData(pixel, CurrentZ(), CurrentStokes(), pixel_bounds, 1, _image_mutex) && !pixel.empty()) {
+                cursor_value_with_current_stokes = pixel[0];
+                have_value = true;
+            }
+        }
+        if (!have_value) {
+            int tile_x = tile_index(x);
+            int tile_y = tile_index(y);
+            auto tile = _tile_cache.Get(TileCache::Key(tile_x, tile_y), _loader, _image_mutex);
+            auto tile_width = tile_size(tile_x, _dims.width);
+            cursor_value_with_current_stokes = tile ? (*tile)[((y - tile_y) * tile_width) + (x - tile_x)] : FLOAT_NAN;
+        }
     }
 
     if (configs.empty()) { // Only send a spatial data message for the cursor value with current stokes
@@ -1250,10 +1279,13 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
             bool have_profile(false);
             bool downsample(mip >= 2);
 
-            if (downsample && _loader->HasMip(2) && !Stokes::IsComputed(stokes_index)) { // Use a mipmap dataset to return downsampled data
-                while (!_loader->HasMip(mip)) {
+            if ((downsample || pixels_on_demand) && _loader->HasMip(2) &&
+                !Stokes::IsComputed(stokes_index)) { // Use a mipmap dataset to return downsampled data
+                while (mip > 1 && !_loader->HasMip(mip)) {
                     mip /= 2;
                 }
+                // Full resolution (from a loader that computes pixels on demand) is a "downsampling" by 1
+                const int data_mip = std::max(mip, 1);
 
                 // Select the bounds of data to downsample so that it contains the requested row or column
                 CARTA::ImageBounds bounds;
@@ -1261,18 +1293,18 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
                 if (is_x_profile) {
                     bounds.set_x_min(start);
                     bounds.set_x_max(end);
-                    int y_floor = std::floor((float)y / mip) * mip;
+                    int y_floor = (y / data_mip) * data_mip;
                     bounds.set_y_min(y_floor);
-                    bounds.set_y_max(y_floor + mip);
+                    bounds.set_y_max(y_floor + data_mip);
                 } else if (is_y_profile) {
-                    int x_floor = std::floor((float)x / mip) * mip;
+                    int x_floor = (x / data_mip) * data_mip;
                     bounds.set_x_min(x_floor);
-                    bounds.set_x_max(x_floor + mip);
+                    bounds.set_x_max(x_floor + data_mip);
                     bounds.set_y_min(start);
                     bounds.set_y_max(end);
                 }
 
-                have_profile = _loader->GetDownsampledRasterData(profile, CurrentZ(), stokes_index, bounds, mip, _image_mutex);
+                have_profile = _loader->GetDownsampledRasterData(profile, CurrentZ(), stokes_index, bounds, data_mip, _image_mutex);
             } else {
                 if (downsample) { // Round the endpoints if we're going to decimate
                     // These values will be used to resize the decimated data
@@ -1301,6 +1333,9 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
                                     return have_profile;
                                 }
                                 auto tile = _tile_cache.Get(key, _loader, _image_mutex);
+                                if (!tile) {
+                                    return have_profile;
+                                }
                                 auto tile_width = tile_size(tile_x, _dims.width);
                                 auto tile_height = tile_size(tile_y, _dims.height);
 
@@ -1324,6 +1359,9 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
                                     return have_profile;
                                 }
                                 auto tile = _tile_cache.Get(key, _loader, _image_mutex);
+                                if (!tile) {
+                                    return have_profile;
+                                }
                                 auto tile_width = tile_size(tile_x, _dims.width);
                                 auto tile_height = tile_size(tile_y, _dims.height);
 

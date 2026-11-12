@@ -98,7 +98,8 @@ bool HealpixLoader::UseTileCache() const {
 }
 
 bool HealpixLoader::HasMip(int mip) const {
-    return (mip >= 2) && (HealpixImage() != nullptr);
+    // Any resolution, full resolution (mip 1) included: every pixel is computed on demand
+    return (mip >= 1) && (HealpixImage() != nullptr);
 }
 
 bool HealpixLoader::GetDownsampledRasterData(

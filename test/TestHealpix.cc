@@ -823,6 +823,150 @@ TEST_F(HealpixTest, CubeSpectralProfilesComeFromTheLoader) {
     }
 }
 
+TEST_F(HealpixTest, CursorValueAndProfilesAreSampledOnDemand) {
+    // The value under the cursor and its full-resolution x and y profiles are read from the loader pixel by pixel,
+    // row and column, instead of through the tile cache (which reprojects a 512 x 512 chunk for one pixel)
+    auto path = GeneratedPath("lonlat_ring_c.fits").string();
+    auto loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+    ASSERT_TRUE(loader);
+    HealpixProjectionOptions options;
+    options.columns = {"LAT"};
+    options.pixel_scale_deg = 0.25; // a grid of several chunks: 1297 x 649
+    loader->SetProjectionOptions(options);
+    std::unique_ptr<Frame> frame(new Frame(0, loader, "1"));
+    ASSERT_TRUE(frame->IsValid()) << frame->GetErrorMessage();
+    EXPECT_TRUE(loader->UseTileCache());
+    EXPECT_TRUE(loader->HasMip(1));
+    auto image = loader->GetImage();
+    const int width = image->shape()(0), height = image->shape()(1);
+    ASSERT_GT(width, 1024);
+
+    auto config = [](const std::string& coordinate, int start, int end, int mip) {
+        CARTA::SetSpatialRequirements_SpatialConfig spatial_config;
+        spatial_config.set_coordinate(coordinate);
+        spatial_config.set_start(start);
+        spatial_config.set_end(end);
+        spatial_config.set_mip(mip);
+        return spatial_config;
+    };
+    const int x = 700, y = 300;
+    casacore::Array<float> row, column;
+    image->doGetSlice(row, casacore::Slicer(casacore::IPosition(2, 0, y), casacore::IPosition(2, width, 1)));
+    image->doGetSlice(column, casacore::Slicer(casacore::IPosition(2, x, 0), casacore::IPosition(2, 1, height)));
+
+    // Full resolution: whole row, part of the column
+    frame->SetSpatialRequirements({config("x", 0, 0, 0), config("y", 100, 500, 0)});
+    frame->SetCursor(x, y);
+    std::vector<CARTA::SpatialProfileData> messages;
+    ASSERT_TRUE(frame->FillSpatialProfileData(messages));
+    ASSERT_EQ(messages.size(), 1);
+    EXPECT_FLOAT_EQ(messages[0].value(), row(casacore::IPosition(2, x, 0)));
+    ASSERT_EQ(messages[0].profiles_size(), 2);
+    for (const auto& profile : messages[0].profiles()) {
+        auto values = GetSpatialProfileValues(profile);
+        EXPECT_EQ(profile.mip(), 0);
+        if (profile.coordinate() == "x") {
+            ASSERT_EQ(values.size(), width);
+            for (int i = 0; i < width; i += 37) {
+                float expected = row(casacore::IPosition(2, i, 0));
+                if (std::isfinite(expected)) {
+                    EXPECT_FLOAT_EQ(values[i], expected) << "x " << i;
+                } else {
+                    EXPECT_TRUE(std::isnan(values[i])) << "x " << i;
+                }
+            }
+        } else {
+            ASSERT_EQ(values.size(), 400);
+            for (int j = 0; j < 400; j += 13) {
+                EXPECT_FLOAT_EQ(values[j], column(casacore::IPosition(2, 0, 100 + j))) << "y " << (100 + j);
+            }
+        }
+    }
+
+    // Downsampled by 4: block centres along the row
+    frame->SetSpatialRequirements({config("x", 0, 0, 4)});
+    frame->SetCursor(x + 1, y);
+    messages.clear();
+    ASSERT_TRUE(frame->FillSpatialProfileData(messages));
+    ASSERT_EQ(messages[0].profiles_size(), 1);
+    auto downsampled = GetSpatialProfileValues(messages[0].profiles(0));
+    EXPECT_EQ(messages[0].profiles(0).mip(), 4);
+    EXPECT_EQ(downsampled.size(), std::ceil(width / 4.0));
+    EXPECT_NEAR(downsampled[x / 4], row(casacore::IPosition(2, x, 0)), 2.0 * 1.8323); // LAT changes slowly along a row
+
+    // A cursor off the sky reads NaN without failing
+    frame->SetSpatialRequirements({});
+    frame->SetCursor(0, 0);
+    messages.clear();
+    ASSERT_TRUE(frame->FillSpatialProfileData(messages));
+    EXPECT_TRUE(std::isnan(messages[0].value()));
+}
+
+TEST_F(HealpixTest, RegriddedMapSharesTheTableInMemory) {
+    // Matching an open map to an image opens the file a second time, on the image's grid, while the first image is
+    // still in use: both read the same maps in memory, so re-gridding neither re-reads nor duplicates the table
+    auto path = GeneratedPath("lonlat_ring_c.fits").string();
+    auto first_loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+    ASSERT_TRUE(first_loader);
+    first_loader->OpenFile("1");
+    auto first = std::dynamic_pointer_cast<CartaHealpixImage>(first_loader->GetImage());
+    ASSERT_TRUE(first);
+
+    casacore::Matrix<double> xform(2, 2, 0.0);
+    xform.diagonal() = 1.0;
+    casacore::DirectionCoordinate target_dir(casacore::MDirection::J2000, casacore::Projection(casacore::Projection::SIN), 80.0 / DEG,
+        -40.0 / DEG, -0.25 / DEG, 0.25 / DEG, xform, 30.0, 20.0);
+    auto match = std::make_shared<casacore::CoordinateSystem>();
+    match->addCoordinate(target_dir);
+    HealpixProjectionOptions options;
+    options.match_coord_sys = match;
+    options.match_shape = casacore::IPosition(2, 60, 40);
+    options.extend_sky = true;
+    auto second_loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+    second_loader->SetProjectionOptions(options);
+    second_loader->OpenFile("1");
+    auto second = std::dynamic_pointer_cast<CartaHealpixImage>(second_loader->GetImage());
+    ASSERT_TRUE(second);
+    EXPECT_TRUE(first->SharesMapsWith(*second));
+    EXPECT_EQ(second->ColumnNames(), first->ColumnNames());
+
+    // The two grids show the same values at the same place: the reference position of the matched grid
+    const auto& first_dir = first->coordinates().directionCoordinate();
+    const auto& second_dir = second->coordinates().directionCoordinate();
+    casacore::Vector<double> world = second_dir.referenceValue(), first_pixel(2);
+    ASSERT_TRUE(first_dir.toPixel(first_pixel, world));
+    auto second_refpix = second_dir.referencePixel();
+    casacore::Array<float> a, b;
+    first->doGetSlice(a, casacore::Slicer(casacore::IPosition(3, std::lround(first_pixel(0)), std::lround(first_pixel(1)), 0),
+                             casacore::IPosition(3, 1, 1, 2)));
+    second->doGetSlice(b, casacore::Slicer(casacore::IPosition(3, std::lround(second_refpix(0)), std::lround(second_refpix(1)), 0),
+                              casacore::IPosition(3, 1, 1, 2)));
+    EXPECT_LT(LonDiff(a(casacore::IPosition(3, 0, 0, 0)), b(casacore::IPosition(3, 0, 0, 0))), 2.0 * 1.8323);
+    EXPECT_NEAR(a(casacore::IPosition(3, 0, 0, 1)), b(casacore::IPosition(3, 0, 0, 1)), 2.0 * 1.8323);
+
+    // Another selection of columns is another set of maps
+    HealpixProjectionOptions one_column;
+    one_column.columns = {"LON"};
+    auto third_loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+    third_loader->SetProjectionOptions(one_column);
+    third_loader->OpenFile("1");
+    auto third = std::dynamic_pointer_cast<CartaHealpixImage>(third_loader->GetImage());
+    ASSERT_TRUE(third);
+    EXPECT_FALSE(first->SharesMapsWith(*third));
+
+    // The maps go with the last image that uses them, and the file opens afresh afterwards
+    first.reset();
+    first_loader.reset();
+    second.reset();
+    second_loader.reset();
+    auto fresh_loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));
+    fresh_loader->OpenFile("1");
+    auto fresh = std::dynamic_pointer_cast<CartaHealpixImage>(fresh_loader->GetImage());
+    ASSERT_TRUE(fresh);
+    EXPECT_FALSE(fresh->SharesMapsWith(*third));
+    EXPECT_EQ(fresh->shape()(2), 2);
+}
+
 TEST_F(HealpixTest, MatchedGridCanBeEnlargedAroundTheImage) {
     auto path = GeneratedPath("lonlat_ring_c.fits").string();
     auto loader = std::dynamic_pointer_cast<HealpixLoader>(FileLoader::GetLoader(path));

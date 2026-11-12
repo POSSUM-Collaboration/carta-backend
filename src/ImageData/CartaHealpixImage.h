@@ -153,6 +153,8 @@ public:
     size_t NumMaps() const;
     /// HEALPix pixels per map
     size_t Npix() const;
+    /// Whether this image and another read the same maps in memory (images of one table HDU and column selection do)
+    bool SharesMapsWith(const CartaHealpixImage& other) const;
     /// A contiguous run of a map's own pixels (NaN where unseen or out of range). Thread-safe.
     void ReadMapRange(size_t map, int64_t first, size_t count, float* out) const;
     /**

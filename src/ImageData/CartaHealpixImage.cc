@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <list>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 
@@ -412,6 +413,12 @@ private:
     std::list<size_t> _order; // most recently used first
 };
 
+// The maps of open table HDUs, shared between the images of one file, HDU and column selection. A map that is
+// reprojected onto another grid (matched to another image, or given another projection) is opened again while its
+// first image is still in use: the second image then neither re-reads the table nor holds a second copy of it.
+std::mutex table_sources_mutex;
+std::map<std::string, std::weak_ptr<HealpixMapSource>> table_sources;
+
 bool IsCompressedFilename(const std::string& filename) {
     for (const char* suffix : {".gz", ".GZ", ".bz2", ".Z", ".zip", ".fz"}) {
         size_t n = std::strlen(suffix);
@@ -686,6 +693,30 @@ void CartaHealpixImage::ReadMap() {
         }
     }
 
+    // The same table (file as it is now, HDU and columns) already open in another image: share its maps
+    std::string source_key;
+    struct stat file_stat;
+    if (stat(_filename.c_str(), &file_stat) == 0) {
+        source_key = _filename + "|" + std::to_string(_hdu) + "|" + std::to_string(static_cast<long long>(file_stat.st_mtime)) + "|" +
+                     std::to_string(static_cast<long long>(file_stat.st_size));
+        for (int idx : selected) {
+            source_key += "|" + std::to_string(idx);
+        }
+        std::lock_guard<std::mutex> guard(table_sources_mutex);
+        auto found = table_sources.find(source_key);
+        if (found != table_sources.end()) {
+            if (auto shared = found->second.lock()) {
+                _column_names.clear();
+                for (int idx : selected) {
+                    _column_names.push_back(_info.columns[idx]);
+                }
+                _source = shared;
+                return;
+            }
+            table_sources.erase(found);
+        }
+    }
+
     fitsfile* fptr(nullptr);
     int status(0);
     fits_open_file(&fptr, _filename.c_str(), READONLY, &status);
@@ -785,6 +816,14 @@ void CartaHealpixImage::ReadMap() {
 
     fits_close_file(fptr, &status);
     _source = std::make_shared<InMemoryMapSource>(std::move(maps));
+
+    if (!source_key.empty()) {
+        std::lock_guard<std::mutex> guard(table_sources_mutex);
+        for (auto it = table_sources.begin(); it != table_sources.end();) {
+            it = it->second.expired() ? table_sources.erase(it) : std::next(it);
+        }
+        table_sources[source_key] = _source;
+    }
 }
 
 void CartaHealpixImage::ReadImageFormatMaps() {
@@ -1247,6 +1286,10 @@ void CartaHealpixImage::Sample(double x0, double dx, size_t nx, double y0, doubl
 
 size_t CartaHealpixImage::Npix() const {
     return _info.npix();
+}
+
+bool CartaHealpixImage::SharesMapsWith(const CartaHealpixImage& other) const {
+    return _source && _source == other._source;
 }
 
 void CartaHealpixImage::ReadMapRange(size_t map, int64_t first, size_t count, float* out) const {

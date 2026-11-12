@@ -39,6 +39,8 @@ public:
 
     // Tiles and downsampled tiles are reprojected on demand at any level, so the frame never needs a full-resolution
     // plane of the grid (which may be extended far beyond the matched image). Not for a transposed view.
+    // HasMip(1) tells the frame that single pixels, rows and columns can be asked for directly as well (the value
+    // under the cursor and its profiles), through GetDownsampledRasterData with mip 1.
     bool UseTileCache() const override;
     bool HasMip(int mip) const override;
     bool GetDownsampledRasterData(

@@ -18,6 +18,7 @@
 #include "ImageData/FileLoader.h"
 
 #define MAX_TILE_CACHE_CAPACITY 4096
+#define MAX_ON_DEMAND_TILE_CACHE_CAPACITY 256 // tiles kept for a loader that computes pixels on demand (64 MB)
 
 namespace carta {
 

@@ -925,14 +925,17 @@ void Session::OnSetImageChannels(const CARTA::SetImageChannels& message) {
 void Session::OnSetCursor(const CARTA::SetCursor& message, uint32_t request_id) {
     // Set cursor for image indicated by file_id
     auto file_id(message.file_id());
-    if (_frames.count(file_id)) { // reference Frame for Region exists
+    auto found = _frames.find(file_id);
+    // Keep the frame for the length of the task: the file may be closed, or re-opened with the same id, meanwhile
+    std::shared_ptr<Frame> frame = (found != _frames.end()) ? found->second : nullptr;
+    if (frame) { // reference Frame for Region exists
         if (message.has_spatial_requirements()) {
             auto requirements = message.spatial_requirements();
             std::vector<CARTA::SetSpatialRequirements_SpatialConfig> profiles = {
                 requirements.spatial_profiles().begin(), requirements.spatial_profiles().end()};
-            _frames.at(file_id)->SetSpatialRequirements(profiles);
+            frame->SetSpatialRequirements(profiles);
         }
-        if (_frames.at(file_id)->SetCursor(message.point().x(), message.point().y())) { // cursor changed
+        if (frame->SetCursor(message.point().x(), message.point().y())) { // cursor changed
             SendSpatialProfileData(file_id, CURSOR_REGION_ID);
             SendSpectralProfileData(file_id, CURSOR_REGION_ID);
         }
@@ -1868,9 +1871,11 @@ bool Session::SendSpatialProfileData(int file_id, int region_id) {
                 file_id, region_id);
         }
     } else if (region_id == CURSOR_REGION_ID) {
-        // Cursor spatial profile
-        if (_frames.find(file_id) != _frames.end()) {
-            if (_frames.at(file_id)->FillSpatialProfileData(spatial_profile_messages)) {
+        // Cursor spatial profile; the frame is kept for the length of the task (the file may be closed meanwhile)
+        auto found = _frames.find(file_id);
+        std::shared_ptr<Frame> frame = (found != _frames.end()) ? found->second : nullptr;
+        if (frame) {
+            if (frame->FillSpatialProfileData(spatial_profile_messages)) {
                 for (auto& spatial_profile_message : spatial_profile_messages) {
                     spatial_profile_message.set_file_id(file_id);
                     spatial_profile_message.set_region_id(region_id);
